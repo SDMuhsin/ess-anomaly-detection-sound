@@ -1,0 +1,17 @@
+# Core ML/DS libraries
+numpy
+torch
+scikit-learn
+matplotlib
+pandas
+
+# Audio processing
+librosa
+
+# Utilities
+tqdm
+PyYAML
+
+# For research experiments
+scipy
+seaborn

@@ -1,0 +1,11 @@
+dataset
+env
+pickle_data/
+results/
+**/**_pycache**
+models/
+logs/
+research_results
+research_models
+research_pickle_data
+**.log
