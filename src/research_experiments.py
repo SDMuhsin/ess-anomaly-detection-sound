@@ -388,7 +388,6 @@ class SklearnAnomalyDetector:
             # One-Class SVM returns distance to separating hyperplane
             scores = self.model.decision_function(X)
             return -scores  # Invert so higher = more anomalous
-import torch.nn.functional as F # Make sure this import is at the top of the file
 
 class SpectralShapeAutoencoder(nn.Module):
     """
@@ -515,23 +514,21 @@ def list_to_vector_array(file_list: list, msg: str, **kwargs) -> np.ndarray:
 
 def get_file_lists(target_dir: Path) -> tuple:
     """Generates training and evaluation file lists from the target directory."""
-    logging.info(f"Target directory: {target_dir}")
-    
+    # This function now just gets files for one directory, to be aggregated later
     normal_files = sorted(target_dir.glob("normal/*.wav"))
     abnormal_files = sorted(target_dir.glob("abnormal/*.wav"))
 
     if not normal_files or not abnormal_files:
-        raise IOError(f"No WAV data found in {target_dir}")
+        raise IOError(f"No WAV data found in normal/ and/or abnormal/ subdirs of {target_dir}")
         
     # Use some normal files for evaluation, the rest for training
+    # This split is consistent with the original MIMII baseline
     train_files = normal_files[len(abnormal_files):]
     eval_normal_files = normal_files[:len(abnormal_files)]
     
     eval_files = eval_normal_files + abnormal_files
     eval_labels = [0] * len(eval_normal_files) + [1] * len(abnormal_files)
 
-    logging.info(f"Training files: {len(train_files)}")
-    logging.info(f"Evaluation files: {len(eval_files)}")
     return train_files, eval_files, eval_labels
 
 ########################################################################
@@ -696,7 +693,7 @@ def evaluate_sklearn_model(model, eval_files, eval_labels, feat_params):
 def measure_model_efficiency(model, input_dim, device, model_path=None):
     """Measure model efficiency metrics"""
     if isinstance(model, SklearnAnomalyDetector):
-        # For sklearn models, we can't easily measure these metrics
+        # For sklearn models, we can't easily measure these metrics this way
         return {
             'model_size_mb': 0.0,
             'num_parameters': 0,
@@ -786,7 +783,6 @@ def create_model(model_name: str, input_dim: int, **kwargs):
         frames = kwargs.get('frames', 5)
         return models[model_name](input_dim, n_mels, frames)
     elif model_name in ['isolation_forest', 'one_class_svm']:
-        # Filter out kwargs that sklearn models don't need
         return models[model_name](input_dim)
     else:
         return models[model_name](input_dim)
@@ -796,175 +792,157 @@ def create_model(model_name: str, input_dim: int, **kwargs):
 ########################################################################
 
 def run_experiment(args):
-    """Run a single experiment with specified parameters"""
+    """
+    Run a single experiment with specified parameters.
+    This version aggregates all data, trains one model, and evaluates once.
+    """
     
-    # Setup paths
+    # Setup paths and device
     pickle_path = Path(args.pickle_dir)
     model_path = Path(args.model_dir)
     result_path = Path(args.result_dir)
-    pickle_path.mkdir(exist_ok=True, parents=True)
-    model_path.mkdir(exist_ok=True, parents=True)
-    result_path.mkdir(exist_ok=True, parents=True)
-    
-    # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
     # Feature extraction parameters
     feat_params = {
-        "n_mels": args.n_mels,
-        "frames": args.frames,
-        "n_fft": args.n_fft,
-        "hop_length": args.hop_length,
-        "power": args.power,
+        "n_mels": args.n_mels, "frames": args.frames, "n_fft": args.n_fft,
+        "hop_length": args.hop_length, "power": args.power,
     }
     input_dim = args.n_mels * args.frames
 
-    # Find all machine type/ID directories
-    target_dirs = [p for p in Path(args.base_dir).glob("*/*/*") 
+    # --- 1. AGGREGATE DATA from all sub-datasets ---
+    logging.info("Aggregating data from all sub-datasets...")
+    target_dirs = [p for p in Path(args.base_dir).glob("*/*/*")
                    if p.is_dir() and (p / "normal").exists() and (p / "abnormal").exists()]
 
-    all_results = []
-    
-    for target_dir in target_dirs:
-        db = target_dir.parents[1].name
-        machine_type = target_dir.parents[0].name
-        machine_id = target_dir.name
-        
-        logging.info(f"\n{'='*50}")
-        logging.info(f"Processing: {machine_type} - {machine_id} - {db}")
-        logging.info(f"Model: {args.model}")
-        logging.info(f"{'='*50}")
-        
-        result_key = f"{machine_type}_{machine_id}_{db}"
-        train_pickle_file = pickle_path / f"train_{result_key}.pkl"
-        
-        # Load or generate training data
-        train_files, eval_files, eval_labels = get_file_lists(target_dir)
+    if not target_dirs:
+        logging.error(f"No valid sub-directories with normal/ and abnormal/ folders found in {args.base_dir}")
+        return []
 
-        if train_pickle_file.exists():
-            logging.info(f"Loading cached training data from {train_pickle_file}")
-            with open(train_pickle_file, "rb") as f:
-                train_data = pickle.load(f)
+    all_train_files, all_eval_files, all_eval_labels = [], [], []
+    for target_dir in tqdm(target_dirs, desc="Scanning directories"):
+        try:
+            train_files, eval_files, eval_labels = get_file_lists(target_dir)
+            all_train_files.extend(train_files)
+            all_eval_files.extend(eval_files)
+            all_eval_labels.extend(eval_labels)
+        except IOError as e:
+            logging.warning(f"Skipping directory {target_dir}: {e}")
+            continue
+
+    if not all_train_files or not all_eval_files:
+        logging.error("No training or evaluation data found across all directories. Exiting.")
+        return []
+
+    logging.info(f"Total training files found: {len(all_train_files)}")
+    logging.info(f"Total evaluation files found: {len(all_eval_files)}")
+
+    # --- 2. PREPARE UNIFIED TRAINING DATA ---
+    pickle_filename = f"train_data_all_{args.n_mels}mels_{args.frames}frames.pkl"
+    train_pickle_file = pickle_path / pickle_filename
+    
+    if train_pickle_file.exists() and not args.retrain:
+        logging.info(f"Loading cached training data from {train_pickle_file}")
+        with open(train_pickle_file, "rb") as f:
+            train_data = pickle.load(f)
+    else:
+        logging.info("Generating aggregated training data from all audio files...")
+        train_data = list_to_vector_array(all_train_files, "Generating combined train vectors", **feat_params)
+        with open(train_pickle_file, "wb") as f:
+            pickle.dump(train_data, f)
+
+    # --- 3. TRAIN A SINGLE MODEL ---
+    logging.info(f"\n{'='*50}")
+    logging.info(f"Training single model '{args.model}' on the entire dataset")
+    logging.info(f"{'='*50}")
+
+    model = create_model(args.model, input_dim, **feat_params)
+    model_file = model_path / f"model_{args.model}_all_machines.pth"
+    
+    start_time = time.time()
+    
+    if isinstance(model, SklearnAnomalyDetector):
+        logging.info("Training sklearn model...")
+        model.fit(train_data)
+        training_time = time.time() - start_time
+    else:
+        model = model.to(device)
+        if model_file.exists() and not args.retrain:
+            logging.info(f"Loading saved model from {model_file}")
+            model.load_state_dict(torch.load(model_file, map_location=device))
+            training_time = 0.0
         else:
-            logging.info("Generating training data from audio files...")
-            train_data = list_to_vector_array(train_files, "Generating train vectors", **feat_params)
-            with open(train_pickle_file, "wb") as f:
-                pickle.dump(train_data, f)
-        
-        # Create model
-        model = create_model(args.model, input_dim, **feat_params)
-        model_file = model_path / f"model_{args.model}_{result_key}.pth"
-        
-        # Training
-        start_time = time.time()
-        
-        if isinstance(model, SklearnAnomalyDetector):
-            # Train sklearn model
-            logging.info("Training sklearn model...")
-            model.fit(train_data)
+            logging.info("Training PyTorch model...")
+            dataset = TensorDataset(torch.from_numpy(train_data).float())
+            val_size = int(len(dataset) * args.val_split)
+            train_size = len(dataset) - val_size
+            train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+            
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
+
+            history = train_pytorch_model(model, train_loader, val_loader, args, device)
             training_time = time.time() - start_time
-            
-            # Evaluate
-            eval_results = evaluate_sklearn_model(model, eval_files, eval_labels, feat_params)
-            efficiency_metrics = measure_model_efficiency(model, input_dim, device)
-            
-        else:
-            # Train PyTorch model
-            model = model.to(device)
-            if model_file.exists() and not args.retrain:
-                logging.info(f"Loading saved model from {model_file}")
-                model.load_state_dict(torch.load(model_file, map_location=device))
-                training_time = 0.0
-            else:
-                logging.info("Training PyTorch model...")
-                
-                # Create dataset and dataloaders
-                dataset = TensorDataset(torch.from_numpy(train_data).float())
-                val_size = int(len(dataset) * args.val_split)
-                train_size = len(dataset) - val_size
-                train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-                
-                train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-                val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-
-                history = train_pytorch_model(model, train_loader, val_loader, args, device)
-                training_time = time.time() - start_time
-                
-                # Save model
-                torch.save(model.state_dict(), model_file)
-            
-            # Evaluate
-            eval_results = evaluate_pytorch_model(model, eval_files, eval_labels, feat_params, device)
-            efficiency_metrics = measure_model_efficiency(model, input_dim, device, model_file)
-        
-        # Collect all results
-        result_entry = {
-            # Experiment parameters
-            'model': args.model,
-            'machine_type': machine_type,
-            'machine_id': machine_id,
-            'db_level': db,
-            'n_mels': args.n_mels,
-            'frames': args.frames,
-            'n_fft': args.n_fft,
-            'hop_length': args.hop_length,
-            'power': args.power,
-            'epochs': args.epochs,
-            'batch_size': args.batch_size,
-            'learning_rate': args.learning_rate,
-            'val_split': args.val_split,
-            
-            # Performance metrics
-            'auc': eval_results['auc'],
-            'pr_auc': eval_results['pr_auc'],
-            
-            # Efficiency metrics
-            'training_time_sec': training_time,
-            'model_size_mb': efficiency_metrics['model_size_mb'],
-            'num_parameters': efficiency_metrics['num_parameters'],
-            'inference_time_ms': efficiency_metrics['inference_time_ms'],
-            'throughput_samples_per_sec': efficiency_metrics['throughput_samples_per_sec'],
-            'memory_usage_mb': efficiency_metrics['memory_usage_mb'],
-            
-            # Data statistics
-            'train_files': len(train_files),
-            'eval_files': len(eval_files),
-            'train_samples': len(train_data),
-        }
-        
-        all_results.append(result_entry)
-        
-        logging.info(f"Results for {result_key}:")
-        logging.info(f"  AUC: {eval_results['auc']:.4f}")
-        logging.info(f"  PR-AUC: {eval_results['pr_auc']:.4f}")
-        logging.info(f"  Training time: {training_time:.2f}s")
-        logging.info(f"  Model size: {efficiency_metrics['model_size_mb']:.2f}MB")
-        logging.info(f"  Parameters: {efficiency_metrics['num_parameters']:,}")
+            torch.save(model.state_dict(), model_file)
     
-    return all_results
+    # --- 4. EVALUATE THE MODEL ONCE ---
+    logging.info("Evaluating model on the entire aggregated dataset...")
+    if isinstance(model, SklearnAnomalyDetector):
+        eval_results = evaluate_sklearn_model(model, all_eval_files, all_eval_labels, feat_params)
+    else:
+        eval_results = evaluate_pytorch_model(model, all_eval_files, all_eval_labels, feat_params, device)
+    
+    efficiency_metrics = measure_model_efficiency(model, input_dim, device, model_file if not isinstance(model, SklearnAnomalyDetector) else None)
+    
+    # --- 5. COLLECT AND REPORT ONE SET OF RESULTS ---
+    result_entry = {
+        'model': args.model,
+        'dataset_scope': 'all_machines',
+        'auc': eval_results['auc'],
+        'pr_auc': eval_results['pr_auc'],
+        'training_time_sec': training_time,
+        **efficiency_metrics,
+        'n_mels': args.n_mels, 'frames': args.frames, 'n_fft': args.n_fft, 'hop_length': args.hop_length,
+        'power': args.power, 'epochs': args.epochs, 'batch_size': args.batch_size, 'learning_rate': args.learning_rate,
+        'val_split': args.val_split,
+        'train_files': len(all_train_files), 'eval_files': len(all_eval_files), 'train_samples': len(train_data),
+    }
+    
+    logging.info(f"\n--- Overall Results for {args.model} ---")
+    logging.info(f"  AUC: {eval_results['auc']:.4f}")
+    logging.info(f"  PR-AUC: {eval_results['pr_auc']:.4f}")
+    logging.info(f"  Training time: {training_time:.2f}s")
+    logging.info(f"  Model size: {efficiency_metrics['model_size_mb']:.2f}MB")
+    logging.info(f"  Parameters: {efficiency_metrics['num_parameters']:,}")
+    
+    return [result_entry] # Return as a list with one item
 
 def save_results_to_csv(results: List[Dict], output_file: Path):
-    """Save experiment results to CSV file"""
+    """Save experiment results to CSV file, appending if the file exists."""
     if not results:
         logging.warning("No results to save")
         return
     
     fieldnames = list(results[0].keys())
     
-    with open(output_file, 'w', newline='') as csvfile:
+    # Check if file exists to determine if we need to write a header
+    write_header = not output_file.exists() or output_file.stat().st_size == 0
+    
+    with open(output_file, 'a', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
         writer.writerows(results)
     
-    logging.info(f"Results saved to {output_file}")
+    logging.info(f"Results appended to {output_file}")
 
 def run_all_models_experiment(args):
-    """Run experiments for all 10 baseline models"""
+    """Run experiments for all baseline models."""
     all_models = [
         'simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
         'attention_ae', 'residual_ae', 'denoising_ae', 
-        'isolation_forest', 'one_class_svm', 'ss_ae'
+        'isolation_forest', 'ss_ae'
     ]
     
     all_experiment_results = []
@@ -974,14 +952,13 @@ def run_all_models_experiment(args):
         logging.info(f"RUNNING EXPERIMENTS FOR MODEL: {model_name.upper()}")
         logging.info(f"{'='*60}")
         
-        # Update args for current model
         args.model = model_name
         
         try:
             model_results = run_experiment(args)
             all_experiment_results.extend(model_results)
         except Exception as e:
-            logging.error(f"Error running experiment for {model_name}: {e}")
+            logging.error(f"Error running experiment for {model_name}: {e}", exc_info=True)
             continue
     
     return all_experiment_results
@@ -998,51 +975,51 @@ def main():
     
     # Dataset and paths
     parser.add_argument("--base_dir", type=str, required=True, 
-                       help="Base directory of the MIMII dataset")
+                        help="Base directory of the MIMII dataset")
     parser.add_argument("--pickle_dir", type=str, default="./research_pickle_data", 
-                       help="Directory for cached feature data")
+                        help="Directory for cached feature data")
     parser.add_argument("--model_dir", type=str, default="./research_models", 
-                       help="Directory to save trained models")
+                        help="Directory to save trained models")
     parser.add_argument("--result_dir", type=str, default="./research_results", 
-                       help="Directory to save results")
+                        help="Directory to save results")
     parser.add_argument("--output_csv", type=str, default="research_results.csv",
-                       help="Output CSV file for results")
+                        help="Output CSV file for results")
     
     # Model selection
     parser.add_argument("--model", type=str, 
-                       choices=['simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
-                               'attention_ae', 'residual_ae', 'denoising_ae', 
-                               'isolation_forest', 'one_class_svm', 'ss_ae','all'],
-                       default='all',
-                       help="Model to train and evaluate")
+                        choices=['simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
+                                 'attention_ae', 'residual_ae', 'denoising_ae', 
+                                 'isolation_forest', 'one_class_svm', 'ss_ae','all'],
+                        default='all',
+                        help="Model to train and evaluate")
     
     # Feature extraction parameters
     parser.add_argument("--n_mels", type=int, default=64, 
-                       help="Number of Mel-frequency bands")
+                        help="Number of Mel-frequency bands")
     parser.add_argument("--frames", type=int, default=5, 
-                       help="Number of frames to concatenate")
+                        help="Number of frames to concatenate")
     parser.add_argument("--n_fft", type=int, default=1024, 
-                       help="FFT size for spectrogram")
+                        help="FFT size for spectrogram")
     parser.add_argument("--hop_length", type=int, default=512, 
-                       help="Hop length for STFT")
+                        help="Hop length for STFT")
     parser.add_argument("--power", type=float, default=2.0, 
-                       help="Exponent for magnitude spectrogram")
+                        help="Exponent for magnitude spectrogram")
     
     # Training parameters
     parser.add_argument("--epochs", type=int, default=50, 
-                       help="Number of training epochs")
+                        help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=256, 
-                       help="Batch size for training")
+                        help="Batch size for training")
     parser.add_argument("--learning_rate", type=float, default=0.001, 
-                       help="Learning rate for optimizer")
+                        help="Learning rate for optimizer")
     parser.add_argument("--val_split", type=float, default=0.1, 
-                       help="Fraction of training data for validation")
+                        help="Fraction of training data for validation")
     
     # Experiment control
     parser.add_argument("--retrain", action="store_true", 
-                       help="Force retraining even if model exists")
+                        help="Force feature regeneration and model retraining")
     parser.add_argument("--seed", type=int, default=42, 
-                       help="Random seed for reproducibility")
+                        help="Random seed for reproducibility")
     
     args = parser.parse_args()
     
@@ -1056,24 +1033,28 @@ def main():
     Path(args.result_dir).mkdir(exist_ok=True, parents=True)
     
     logging.info("="*60)
-    logging.info("MIMII DATASET RESEARCH EXPERIMENTS")
+    logging.info("MIMII DATASET RESEARCH EXPERIMENTS (UNIFIED TRAINING)")
     logging.info("="*60)
     logging.info(f"Base directory: {args.base_dir}")
     logging.info(f"Model(s): {args.model}")
     logging.info(f"Feature params: n_mels={args.n_mels}, frames={args.frames}")
     logging.info(f"Training params: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
-    logging.info(f"Output CSV: {args.output_csv}")
+    logging.info(f"Output CSV: {Path(args.result_dir) / args.output_csv}")
     logging.info("="*60)
     
     # Run experiments
+    start_time = time.time()
     if args.model == 'all':
         results = run_all_models_experiment(args)
     else:
         results = run_experiment(args)
     
     # Save results to CSV
-    output_path = Path(args.result_dir) / args.output_csv
-    save_results_to_csv(results, output_path)
+    if results:
+        output_path = Path(args.result_dir) / args.output_csv
+        save_results_to_csv(results, output_path)
+    
+    total_time = time.time() - start_time
     
     # Print summary
     if results:
@@ -1081,20 +1062,15 @@ def main():
         logging.info("EXPERIMENT SUMMARY")
         logging.info("="*60)
         
-        # Group results by model
-        model_results = {}
+        # Simple printout since each model now has one aggregated score
         for result in results:
             model_name = result['model']
-            if model_name not in model_results:
-                model_results[model_name] = []
-            model_results[model_name].append(result['auc'])
-        
-        for model_name, aucs in model_results.items():
-            avg_auc = np.mean(aucs)
-            std_auc = np.std(aucs)
-            logging.info(f"{model_name:15s}: AUC = {avg_auc:.4f} ± {std_auc:.4f} (n={len(aucs)})")
+            auc_score = result['auc']
+            pr_auc_score = result['pr_auc']
+            logging.info(f"{model_name:17s}: AUC = {auc_score:.4f} | PR-AUC = {pr_auc_score:.4f}")
         
         logging.info(f"\nTotal experiments completed: {len(results)}")
+        logging.info(f"Total run time: {total_time:.2f} seconds")
         logging.info(f"Results saved to: {output_path}")
     
     logging.info("Experiments completed successfully!")
