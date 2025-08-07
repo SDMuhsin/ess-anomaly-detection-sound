@@ -1,14 +1,17 @@
 dataset
 env
-pickle_data/
+cache/
 results/
 **/**_pycache**
+**.log
+
+# Legacy directories (can be removed after migration)
+pickle_data/
 models/
 logs/
-research_results
-research_models
-research_pickle_data
-**.log
-**data/
-**models/
-**results/
+research_results/
+research_models/
+research_pickle_data/
+research_classification_models/
+research_classification_pickle_data/
+research_classification_results/

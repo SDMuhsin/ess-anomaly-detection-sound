@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Research Classification Experiments Runner for MIMII Dataset
-Supports 10 different baseline models for supervised classification research
+Research Experiments Runner for MIMII Dataset
+Supports 10 different baseline models for anomaly detection research
 """
 import argparse
 import csv
@@ -18,9 +18,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
-from sklearn.svm import SVC
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from sklearn.svm import OneClassSVM
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 import yaml
@@ -30,81 +30,89 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("research_classification.log"),
+        logging.FileHandler("research_experiments.log"),
         logging.StreamHandler(sys.stdout),
     ],
 )
 
 ########################################################################
-# Classification Model Definitions
+# Model Definitions
 ########################################################################
 
-class SimpleClassifier(nn.Module):
-    """Simple 3-layer classifier (baseline)"""
-    def __init__(self, input_dim, num_classes):
+class SimpleAutoencoder(nn.Module):
+    """Simple 3-layer autoencoder (baseline)"""
+    def __init__(self, input_dim):
         super().__init__()
-        self.classifier = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
+            nn.Linear(64, 8),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(8, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim),
         )
 
     def forward(self, x):
-        return self.classifier(x)
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
-class DeepClassifier(nn.Module):
-    """Deep classifier with multiple hidden layers"""
-    def __init__(self, input_dim, num_classes):
+class DeepAutoencoder(nn.Module):
+    """Deep autoencoder with multiple hidden layers"""
+    def __init__(self, input_dim):
         super().__init__()
-        self.classifier = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(32, 16),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(16, num_classes),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, input_dim),
         )
 
     def forward(self, x):
-        return self.classifier(x)
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
-class VariationalClassifier(nn.Module):
-    """Variational classifier with probabilistic latent space"""
-    def __init__(self, input_dim, num_classes, latent_dim=16):
+class VariationalAutoencoder(nn.Module):
+    """Variational Autoencoder for anomaly detection"""
+    def __init__(self, input_dim, latent_dim=16):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
-        self.num_classes = num_classes
         
         # Encoder
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
         )
         self.fc_mu = nn.Linear(64, latent_dim)
         self.fc_logvar = nn.Linear(64, latent_dim)
         
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 32),
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, input_dim),
         )
 
     def encode(self, x):
@@ -118,132 +126,131 @@ class VariationalClassifier(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def decode(self, z):
+        return self.decoder(z)
+
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        output = self.classifier(z)
-        return output, mu, logvar
+        recon = self.decode(z)
+        return recon, mu, logvar
 
-class ConvClassifier(nn.Module):
-    """Convolutional classifier for spectral features"""
-    def __init__(self, input_dim, num_classes, n_mels=64, frames=5):
+class ConvAutoencoder(nn.Module):
+    """Convolutional Autoencoder for spectral features"""
+    def __init__(self, input_dim, n_mels=64, frames=5):
         super().__init__()
         self.n_mels = n_mels
         self.frames = frames
         self.input_dim = input_dim
         
-        # Convolutional layers
-        self.conv_layers = nn.Sequential(
+        # Encoder
+        self.encoder = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
         )
         
-        # Calculate flattened size
-        self.flat_size = 64 * 4 * 4
+        # Calculate flattened size after convolutions
+        self.encoded_h = self.n_mels // 4  # Two MaxPool2d with kernel_size=2
+        self.encoded_w = self.frames // 4
+        self.flat_size = 64 * self.encoded_h * self.encoded_w
         
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(self.flat_size, 128),
+        self.fc_encode = nn.Linear(self.flat_size, 32)
+        self.fc_decode = nn.Linear(32, self.flat_size)
+        
+        # Decoder - use ConvTranspose2d with proper output_padding to restore exact dimensions
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
+            nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2, padding=0, output_padding=0),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, num_classes),
+            nn.ConvTranspose2d(16, 1, kernel_size=2, stride=2, padding=0, output_padding=(self.n_mels % 4, self.frames % 4)),
         )
 
     def forward(self, x):
         batch_size = x.size(0)
         x = x.view(batch_size, 1, self.n_mels, self.frames)
         
-        # Convolutional feature extraction
-        features = self.conv_layers(x)
-        flat = features.view(batch_size, -1)
+        # Encode
+        encoded = self.encoder(x)
+        flat = encoded.view(batch_size, -1)
+        bottleneck = self.fc_encode(flat)
         
-        # Classification
-        output = self.classifier(flat)
-        return output
+        # Decode
+        decoded_flat = self.fc_decode(bottleneck)
+        decoded_conv = decoded_flat.view(batch_size, 64, self.encoded_h, self.encoded_w)
+        output = self.decoder(decoded_conv)
+        
+        # Ensure output matches input dimensions exactly
+        output = output[:, :, :self.n_mels, :self.frames]
+        
+        return output.view(batch_size, self.input_dim)
 
-class LSTMClassifier(nn.Module):
-    """LSTM-based classifier for temporal patterns"""
-    def __init__(self, input_dim, num_classes, hidden_dim=64, num_layers=2):
+class LSTMAutoencoder(nn.Module):
+    """LSTM-based Autoencoder for temporal patterns"""
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # LSTM layers
-        self.lstm = nn.LSTM(1, hidden_dim, num_layers, batch_first=True, dropout=0.2)
+        # Encoder LSTM
+        self.encoder_lstm = nn.LSTM(1, hidden_dim, num_layers, batch_first=True)
         
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
-        )
+        # Decoder LSTM
+        self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.output_layer = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
         batch_size = x.size(0)
         x = x.unsqueeze(-1)  # Add feature dimension
         
-        # LSTM processing
-        lstm_out, (hidden, _) = self.lstm(x)
+        # Encode
+        encoded, (hidden, cell) = self.encoder_lstm(x)
         
-        # Use last hidden state for classification
-        last_hidden = hidden[-1]  # Take last layer's hidden state
+        # Use last hidden state as context
+        context = encoded[:, -1:, :].repeat(1, self.input_dim, 1)
         
-        # Classification
-        output = self.classifier(last_hidden)
-        return output
+        # Decode
+        decoded, _ = self.decoder_lstm(context, (hidden, cell))
+        output = self.output_layer(decoded)
+        
+        return output.squeeze(-1)
 
-class AttentionClassifier(nn.Module):
-    """Classifier with attention mechanism"""
-    def __init__(self, input_dim, num_classes, hidden_dim=128):
+class AttentionAutoencoder(nn.Module):
+    """Autoencoder with attention mechanism"""
+    def __init__(self, input_dim, hidden_dim=128):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         
-        # Feature encoder
+        # Encoder
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
         )
         
         # Attention mechanism
-        self.attention = nn.MultiheadAttention(64, num_heads=8, batch_first=True, dropout=0.1)
+        self.attention = nn.MultiheadAttention(64, num_heads=8, batch_first=True)
         
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(64, 64),
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(64, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
+            nn.Linear(hidden_dim, input_dim),
         )
 
     def forward(self, x):
         batch_size = x.size(0)
         
-        # Encode features
+        # Encode
         encoded = self.encoder(x)
         
         # Reshape for attention (treat features as sequence)
@@ -253,77 +260,90 @@ class AttentionClassifier(nn.Module):
         attended, _ = self.attention(encoded, encoded, encoded)
         attended = attended.squeeze(1)
         
-        # Classification
-        output = self.classifier(attended)
-        return output
+        # Decode
+        decoded = self.decoder(attended)
+        return decoded
 
-class ResidualClassifier(nn.Module):
-    """Classifier with residual connections"""
-    def __init__(self, input_dim, num_classes):
+class ResidualAutoencoder(nn.Module):
+    """Autoencoder with residual connections"""
+    def __init__(self, input_dim):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, 128)
         
-        # Residual blocks
-        self.res_block1 = self._make_residual_block(128, 128)
-        self.res_block2 = self._make_residual_block(128, 64)
+        # Encoder blocks
+        self.enc_block1 = self._make_residual_block(128, 128)
+        self.enc_block2 = self._make_residual_block(128, 64)
+        self.bottleneck = nn.Linear(64, 16)
         
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, num_classes),
-        )
+        # Decoder blocks
+        self.dec_proj = nn.Linear(16, 64)
+        self.dec_block1 = self._make_residual_block(64, 64)
+        self.dec_block2 = self._make_residual_block(64, 128)
+        self.output_proj = nn.Linear(128, input_dim)
 
     def _make_residual_block(self, in_dim, out_dim):
         return nn.Sequential(
             nn.Linear(in_dim, out_dim),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(out_dim, out_dim),
         )
 
     def forward(self, x):
-        # Initial projection
+        # Encoder
         x = F.relu(self.input_proj(x))
         
         # Residual blocks
         residual = x
-        x = self.res_block1(x)
+        x = self.enc_block1(x)
         if x.size(-1) == residual.size(-1):
             x = x + residual
         x = F.relu(x)
         
-        x = self.res_block2(x)
+        x = self.enc_block2(x)
         x = F.relu(x)
         
-        # Classification
-        output = self.classifier(x)
-        return output
+        # Bottleneck
+        x = F.relu(self.bottleneck(x))
+        
+        # Decoder
+        x = F.relu(self.dec_proj(x))
+        
+        residual = x
+        x = self.dec_block1(x)
+        x = x + residual
+        x = F.relu(x)
+        
+        x = self.dec_block2(x)
+        x = F.relu(x)
+        
+        x = self.output_proj(x)
+        return x
 
-class DenoisingClassifier(nn.Module):
-    """Denoising classifier with noise injection during training"""
-    def __init__(self, input_dim, num_classes, noise_factor=0.1):
+class DenoisingAutoencoder(nn.Module):
+    """Denoising Autoencoder"""
+    def __init__(self, input_dim, noise_factor=0.1):
         super().__init__()
         self.noise_factor = noise_factor
         
-        self.feature_extractor = nn.Sequential(
+        self.encoder = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
             nn.Dropout(0.2),
+            nn.Linear(64, 16),
+            nn.ReLU(),
         )
         
-        self.classifier = nn.Sequential(
-            nn.Linear(32, 16),
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(16, num_classes),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, input_dim),
         )
 
     def add_noise(self, x):
@@ -334,55 +354,58 @@ class DenoisingClassifier(nn.Module):
 
     def forward(self, x):
         noisy_x = self.add_noise(x)
-        features = self.feature_extractor(noisy_x)
-        output = self.classifier(features)
-        return output
+        encoded = self.encoder(noisy_x)
+        decoded = self.decoder(encoded)
+        return decoded
 
 ########################################################################
 # Classical ML Models (Sklearn-based)
 ########################################################################
 
-class SklearnClassifier:
-    """Wrapper for sklearn-based classification models"""
-    def __init__(self, model_type='random_forest', num_classes=4, **kwargs):
+class SklearnAnomalyDetector:
+    """Wrapper for sklearn-based anomaly detection models"""
+    def __init__(self, model_type='isolation_forest', **kwargs):
         self.model_type = model_type
-        self.num_classes = num_classes
-        if model_type == 'random_forest':
-            self.model = RandomForestClassifier(random_state=42, n_estimators=100, **kwargs)
-        elif model_type == 'svm':
-            self.model = SVC(random_state=42, probability=True, **kwargs)
+        if model_type == 'isolation_forest':
+            self.model = IsolationForest(random_state=42, **kwargs)
+        elif model_type == 'one_class_svm':
+            self.model = OneClassSVM(**kwargs)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
     
-    def fit(self, X, y):
-        self.model.fit(X, y)
+    def fit(self, X):
+        self.model.fit(X)
     
-    def predict(self, X):
-        return self.model.predict(X)
-    
-    def predict_proba(self, X):
-        return self.model.predict_proba(X)
+    def predict_anomaly_scores(self, X):
+        if self.model_type == 'isolation_forest':
+            # Isolation Forest returns anomaly scores (lower = more anomalous)
+            scores = self.model.decision_function(X)
+            return -scores  # Invert so higher = more anomalous
+        elif self.model_type == 'one_class_svm':
+            # One-Class SVM returns distance to separating hyperplane
+            scores = self.model.decision_function(X)
+            return -scores  # Invert so higher = more anomalous
 
-class SpectralShapeClassifier(nn.Module):
+class SpectralShapeAutoencoder(nn.Module):
     """
-    Classification equivalent of SpectralShapeAutoencoder (ss_ae).
-    This version processes each spectral slice within the time-frequency
-    window using a shared-weight projection, then uses a normalized basis
-    for efficient feature extraction before classification.
+    Final Rework: This version processes each spectral slice within the time-frequency
+    window using a shared-weight projection. This efficiently captures spatial features
+    before the results are concatenated and passed to the core 'normalized basis' 
+    bottleneck. This hierarchical, parameter-efficient design preserves context
+    while remaining true to the novel paradigm.
     """
-    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, latent_dim=32, slice_latent_dim=64):
+    def __init__(self, input_dim, n_mels=64, frames=5, latent_dim=32, slice_latent_dim=64):
         super().__init__()
         self.n_mels = n_mels
         self.frames = frames
         self.latent_dim = latent_dim
         self.slice_latent_dim = slice_latent_dim
         self.input_dim = input_dim
-        self.num_classes = num_classes
         
         # Combined dimension after processing each slice
         self.combined_dim = frames * slice_latent_dim
 
-        # === FEATURE EXTRACTOR ===
+        # === ENCODER ===
         # A shared linear layer to process each of the 5 spectral slices
         self.slice_encoder = nn.Sequential(
             nn.LayerNorm(n_mels),
@@ -398,17 +421,16 @@ class SpectralShapeClassifier(nn.Module):
         self.bottleneck_mlp = nn.Sequential(
             nn.LayerNorm(latent_dim),
             nn.Linear(latent_dim, latent_dim),
-            nn.GELU(),
-            nn.Dropout(0.2)
+            nn.GELU()
         )
 
-        # === CLASSIFIER ===
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(latent_dim // 2, num_classes),
+        # === DECODER ===
+        # Reconstructs the combined vector from the latent code
+        self.global_decoder = nn.Linear(latent_dim, self.combined_dim, bias=False)
+
+        # A shared linear layer to reconstruct each spectral slice
+        self.slice_decoder = nn.Sequential(
+            nn.Linear(slice_latent_dim, n_mels)
         )
 
     def forward(self, x):
@@ -429,12 +451,23 @@ class SpectralShapeClassifier(nn.Module):
         latent_code = torch.matmul(combined_vec, normalized_basis.T)
         
         # 5. Pass through bottleneck MLP for more capacity
-        features = self.bottleneck_mlp(latent_code)
+        latent_code = self.bottleneck_mlp(latent_code)
 
-        # 6. Classification
-        output = self.classifier(features)
+        # 6. Reconstruct the combined vector using the same basis (or a separate linear layer)
+        # Using the basis maintains the tied-weight paradigm
+        reconstructed_combined = torch.matmul(latent_code, normalized_basis)
         
-        return output
+        # 7. Reshape back into slice-wise representations
+        reconstructed_slices_latent = reconstructed_combined.view(-1, self.frames, self.slice_latent_dim)
+        
+        # 8. Decode each slice using the shared decoder
+        reconstructed_slices = self.slice_decoder(reconstructed_slices_latent)
+        
+        # 9. Flatten to original output shape
+        reconstructed_x = reconstructed_slices.view(-1, self.input_dim)
+        
+        return reconstructed_x
+
 
 ########################################################################
 # Data Handling and Feature Extraction
@@ -476,286 +509,187 @@ def list_to_vector_array(file_list: list, msg: str, **kwargs) -> np.ndarray:
     ]
     return np.concatenate([v for v in feature_vectors if v.size > 0], axis=0)
 
-def get_classification_file_lists(base_dir: Path) -> tuple:
-    """
-    Generates training and evaluation file lists with labels for normal vs abnormal classification.
-    
-    Args:
-        base_dir: Base directory containing the dataset
-    
-    Returns:
-        train_files, train_labels, eval_files, eval_labels, label_to_name
-    """
-    # Find all valid directories
-    target_dirs = [p for p in base_dir.glob("*/*/*")
-                   if p.is_dir() and (p / "normal").exists() and (p / "abnormal").exists()]
+def get_file_lists(target_dir: Path) -> tuple:
+    """Generates training and evaluation file lists from the target directory."""
+    # This function now just gets files for one directory, to be aggregated later
+    normal_files = sorted(target_dir.glob("normal/*.wav"))
+    abnormal_files = sorted(target_dir.glob("abnormal/*.wav"))
 
-    if not target_dirs:
-        raise IOError(f"No valid sub-directories with normal/ and abnormal/ folders found in {base_dir}")
-
-    all_files = []
-    all_labels = []
-    
-    # Binary classification: 0=normal, 1=abnormal
-    label_to_name = {0: 'normal', 1: 'abnormal'}
-    
-    for target_dir in target_dirs:
-        # Get normal files (label = 0)
-        normal_files = sorted(target_dir.glob("normal/*.wav"))
-        for file_path in normal_files:
-            all_files.append(file_path)
-            all_labels.append(0)  # normal = 0
+    if not normal_files or not abnormal_files:
+        raise IOError(f"No WAV data found in normal/ and/or abnormal/ subdirs of {target_dir}")
         
-        # Get abnormal files (label = 1)
-        abnormal_files = sorted(target_dir.glob("abnormal/*.wav"))
-        for file_path in abnormal_files:
-            all_files.append(file_path)
-            all_labels.append(1)  # abnormal = 1
+    # Use some normal files for evaluation, the rest for training
+    # This split is consistent with the original MIMII baseline
+    train_files = normal_files[len(abnormal_files):]
+    eval_normal_files = normal_files[:len(abnormal_files)]
+    
+    eval_files = eval_normal_files + abnormal_files
+    eval_labels = [0] * len(eval_normal_files) + [1] * len(abnormal_files)
 
-    # Split into train and eval (80/20 split)
-    from sklearn.model_selection import train_test_split
-    train_files, eval_files, train_labels, eval_labels = train_test_split(
-        all_files, all_labels, test_size=0.2, random_state=42, stratify=all_labels
-    )
-
-    return train_files, train_labels, eval_files, eval_labels, label_to_name
+    return train_files, eval_files, eval_labels
 
 ########################################################################
 # Training and Evaluation Functions
 ########################################################################
 
-def train_pytorch_classifier(model, train_loader, val_loader, args, device, num_classes):
-    """Trains PyTorch classification models"""
-    if isinstance(model, VariationalClassifier):
-        return train_variational_classifier(model, train_loader, val_loader, args, device, num_classes)
+def train_pytorch_model(model, train_loader, val_loader, args, device):
+    """Trains PyTorch models"""
+    if isinstance(model, VariationalAutoencoder):
+        return train_vae(model, train_loader, val_loader, args, device)
     else:
-        return train_standard_classifier(model, train_loader, val_loader, args, device, num_classes)
+        return train_standard_ae(model, train_loader, val_loader, args, device)
 
-def train_standard_classifier(model, train_loader, val_loader, args, device, num_classes):
-    """Train standard classification models"""
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+def train_standard_ae(model, train_loader, val_loader, args, device):
+    """Train standard autoencoder models"""
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+    history = {"loss": [], "val_loss": []}
 
     for epoch in range(args.epochs):
         # Training phase
         model.train()
         train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        
-        for data, targets in train_loader:
+        for data, in train_loader:
             inputs = data.to(device)
-            targets = targets.to(device)
-            
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, inputs)
             loss.backward()
             optimizer.step()
-            
             train_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += targets.size(0)
-            train_correct += (predicted == targets).sum().item()
         
         # Validation phase
         model.eval()
         val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        
         with torch.no_grad():
-            for data, targets in val_loader:
+            for data, in val_loader:
                 inputs = data.to(device)
-                targets = targets.to(device)
-                
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
+                loss = criterion(outputs, inputs)
                 val_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += targets.size(0)
-                val_correct += (predicted == targets).sum().item()
 
         epoch_train_loss = train_loss / len(train_loader.dataset)
         epoch_val_loss = val_loss / len(val_loader.dataset)
-        epoch_train_acc = 100 * train_correct / train_total
-        epoch_val_acc = 100 * val_correct / val_total
         
         history["loss"].append(epoch_train_loss)
         history["val_loss"].append(epoch_val_loss)
-        history["accuracy"].append(epoch_train_acc)
-        history["val_accuracy"].append(epoch_val_acc)
-        
-        scheduler.step(epoch_val_loss)
 
         if (epoch + 1) % 10 == 0:
             logging.info(
-                f"Epoch {epoch+1}/{args.epochs} - Loss: {epoch_train_loss:.6f} - Acc: {epoch_train_acc:.2f}% - "
-                f"Val Loss: {epoch_val_loss:.6f} - Val Acc: {epoch_val_acc:.2f}%"
+                f"Epoch {epoch+1}/{args.epochs} - Loss: {epoch_train_loss:.6f} - Val Loss: {epoch_val_loss:.6f}"
             )
-    
     return history
 
-def train_variational_classifier(model, train_loader, val_loader, args, device, num_classes):
-    """Train Variational Classifier"""
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+def train_vae(model, train_loader, val_loader, args, device):
+    """Train Variational Autoencoder"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
-    history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+    history = {"loss": [], "val_loss": []}
 
-    def vae_classification_loss(outputs, targets, mu, logvar, beta=0.1):
-        ce_loss = criterion(outputs, targets)
+    def vae_loss(recon_x, x, mu, logvar):
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
         kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kld_loss = kld_loss / targets.size(0)  # Normalize by batch size
-        return ce_loss + beta * kld_loss
+        return recon_loss + kld_loss
 
     for epoch in range(args.epochs):
         # Training phase
         model.train()
         train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        
-        for data, targets in train_loader:
+        for data, in train_loader:
             inputs = data.to(device)
-            targets = targets.to(device)
-            
             optimizer.zero_grad()
-            outputs, mu, logvar = model(inputs)
-            loss = vae_classification_loss(outputs, targets, mu, logvar)
+            recon, mu, logvar = model(inputs)
+            loss = vae_loss(recon, inputs, mu, logvar)
             loss.backward()
             optimizer.step()
-            
-            train_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += targets.size(0)
-            train_correct += (predicted == targets).sum().item()
+            train_loss += loss.item()
         
         # Validation phase
         model.eval()
         val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        
         with torch.no_grad():
-            for data, targets in val_loader:
+            for data, in val_loader:
                 inputs = data.to(device)
-                targets = targets.to(device)
-                
-                outputs, mu, logvar = model(inputs)
-                loss = vae_classification_loss(outputs, targets, mu, logvar)
-                
-                val_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += targets.size(0)
-                val_correct += (predicted == targets).sum().item()
+                recon, mu, logvar = model(inputs)
+                loss = vae_loss(recon, inputs, mu, logvar)
+                val_loss += loss.item()
 
         epoch_train_loss = train_loss / len(train_loader.dataset)
         epoch_val_loss = val_loss / len(val_loader.dataset)
-        epoch_train_acc = 100 * train_correct / train_total
-        epoch_val_acc = 100 * val_correct / val_total
         
         history["loss"].append(epoch_train_loss)
         history["val_loss"].append(epoch_val_loss)
-        history["accuracy"].append(epoch_train_acc)
-        history["val_accuracy"].append(epoch_val_acc)
-        
-        scheduler.step(epoch_val_loss)
 
         if (epoch + 1) % 10 == 0:
             logging.info(
-                f"Epoch {epoch+1}/{args.epochs} - Loss: {epoch_train_loss:.6f} - Acc: {epoch_train_acc:.2f}% - "
-                f"Val Loss: {epoch_val_loss:.6f} - Val Acc: {epoch_val_acc:.2f}%"
+                f"Epoch {epoch+1}/{args.epochs} - Loss: {epoch_train_loss:.6f} - Val Loss: {epoch_val_loss:.6f}"
             )
-    
     return history
 
-def evaluate_pytorch_classifier(model, eval_files, eval_labels, feat_params, device, label_to_name):
-    """Evaluates PyTorch classification models and calculates metrics"""
+def evaluate_pytorch_model(model, eval_files, eval_labels, feat_params, device):
+    """Evaluates PyTorch models and calculates metrics"""
     model.eval()
-    y_true = []
+    y_true = eval_labels
     y_pred = []
 
     with torch.no_grad():
-        for file_path, true_label in tqdm(zip(eval_files, eval_labels), desc="Evaluating", total=len(eval_files)):
+        for file_path in tqdm(eval_files, desc="Evaluating"):
             vectors = file_to_vector_array(file_path, **feat_params)
             if vectors.shape[0] == 0:
-                y_pred.append(0)  # Default prediction
-                y_true.append(true_label)
+                y_pred.append(0.0)
                 continue
 
             data = torch.from_numpy(vectors).float().to(device)
             
-            if isinstance(model, VariationalClassifier):
-                outputs, _, _ = model(data)
+            if isinstance(model, VariationalAutoencoder):
+                reconstruction, _, _ = model(data)
             else:
-                outputs = model(data)
+                reconstruction = model(data)
             
-            # Average predictions across all frames
-            probs = F.softmax(outputs, dim=1)
-            avg_probs = torch.mean(probs, dim=0)
-            predicted_class = torch.argmax(avg_probs).item()
-            
-            y_pred.append(predicted_class)
-            y_true.append(true_label)
+            errors = torch.mean(torch.square(data - reconstruction), axis=1)
+            y_pred.append(torch.mean(errors).item())
 
     # Calculate metrics
-    accuracy = accuracy_score(y_true, y_pred)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
-    conf_matrix = confusion_matrix(y_true, y_pred)
+    auc_score = roc_auc_score(y_true, y_pred)
+    precision, recall, _ = precision_recall_curve(y_true, y_pred)
+    pr_auc = auc(recall, precision)
     
     return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'confusion_matrix': conf_matrix.tolist(),
-        'y_pred': y_pred,
-        'y_true': y_true
+        'auc': auc_score,
+        'pr_auc': pr_auc,
+        'y_pred': y_pred
     }
 
-def evaluate_sklearn_classifier(model, eval_files, eval_labels, feat_params, label_to_name):
-    """Evaluates sklearn classification models"""
-    y_true = []
+def evaluate_sklearn_model(model, eval_files, eval_labels, feat_params):
+    """Evaluates sklearn models"""
+    y_true = eval_labels
     y_pred = []
 
-    for file_path, true_label in tqdm(zip(eval_files, eval_labels), desc="Evaluating", total=len(eval_files)):
+    for file_path in tqdm(eval_files, desc="Evaluating"):
         vectors = file_to_vector_array(file_path, **feat_params)
         if vectors.shape[0] == 0:
-            y_pred.append(0)  # Default prediction
-            y_true.append(true_label)
+            y_pred.append(0.0)
             continue
         
-        # Use majority vote across all frames
-        frame_predictions = model.predict(vectors)
-        predicted_class = np.bincount(frame_predictions).argmax()
-        
-        y_pred.append(predicted_class)
-        y_true.append(true_label)
+        # Use mean anomaly score across all frames
+        scores = model.predict_anomaly_scores(vectors)
+        y_pred.append(np.mean(scores))
 
     # Calculate metrics
-    accuracy = accuracy_score(y_true, y_pred)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
-    conf_matrix = confusion_matrix(y_true, y_pred)
+    auc_score = roc_auc_score(y_true, y_pred)
+    precision, recall, _ = precision_recall_curve(y_true, y_pred)
+    pr_auc = auc(recall, precision)
     
     return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'confusion_matrix': conf_matrix.tolist(),
-        'y_pred': y_pred,
-        'y_true': y_true
+        'auc': auc_score,
+        'pr_auc': pr_auc,
+        'y_pred': y_pred
     }
 
 def measure_model_efficiency(model, input_dim, device, model_path=None):
     """Measure model efficiency metrics"""
-    if isinstance(model, SklearnClassifier):
+    if isinstance(model, SklearnAnomalyDetector):
         # For sklearn models, we can't easily measure these metrics this way
         return {
             'model_size_mb': 0.0,
@@ -780,7 +714,7 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
     # Warm up
     with torch.no_grad():
         for _ in range(10):
-            if isinstance(model, VariationalClassifier):
+            if isinstance(model, VariationalAutoencoder):
                 _ = model(test_data[:10])
             else:
                 _ = model(test_data[:10])
@@ -791,7 +725,7 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
     
     start_time = time.time()
     with torch.no_grad():
-        if isinstance(model, VariationalClassifier):
+        if isinstance(model, VariationalAutoencoder):
             outputs, _, _ = model(test_data)
         else:
             outputs = model(test_data)
@@ -822,32 +756,33 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
 # Model Factory
 ########################################################################
 
-def create_model(model_name: str, input_dim: int, num_classes: int, **kwargs):
-    """Factory function to create classification models"""
+def create_model(model_name: str, input_dim: int, **kwargs):
+    """Factory function to create models"""
     models = {
-        'simple_classifier': SimpleClassifier,
-        'deep_classifier': DeepClassifier,
-        'vae_classifier': VariationalClassifier,
-        'conv_classifier': ConvClassifier,
-        'lstm_classifier': LSTMClassifier,
-        'attention_classifier': AttentionClassifier,
-        'residual_classifier': ResidualClassifier,
-        'denoising_classifier': DenoisingClassifier,
-        'random_forest': lambda input_dim, num_classes, **kw: SklearnClassifier('random_forest', num_classes),
-        'ss_classifier': SpectralShapeClassifier,
+        'simple_ae': SimpleAutoencoder,
+        'deep_ae': DeepAutoencoder,
+        'vae': VariationalAutoencoder,
+        'conv_ae': ConvAutoencoder,
+        'lstm_ae': LSTMAutoencoder,
+        'attention_ae': AttentionAutoencoder,
+        'residual_ae': ResidualAutoencoder,
+        'denoising_ae': DenoisingAutoencoder,
+        'isolation_forest': lambda input_dim, **kw: SklearnAnomalyDetector('isolation_forest'),
+        'one_class_svm': lambda input_dim, **kw: SklearnAnomalyDetector('one_class_svm'),
+        'ss_ae': SpectralShapeAutoencoder,
     }
     
     if model_name not in models:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(models.keys())}")
     
-    if model_name in ['conv_classifier', 'ss_classifier']:
+    if model_name in ['conv_ae','ss_ae']:
         n_mels = kwargs.get('n_mels', 64)
         frames = kwargs.get('frames', 5)
-        return models[model_name](input_dim, num_classes, n_mels, frames)
-    elif model_name in ['random_forest', 'svm']:
-        return models[model_name](input_dim, num_classes)
+        return models[model_name](input_dim, n_mels, frames)
+    elif model_name in ['isolation_forest', 'one_class_svm']:
+        return models[model_name](input_dim)
     else:
-        return models[model_name](input_dim, num_classes)
+        return models[model_name](input_dim)
 
 ########################################################################
 # Main Experiment Runner
@@ -855,7 +790,8 @@ def create_model(model_name: str, input_dim: int, num_classes: int, **kwargs):
 
 def run_experiment(args):
     """
-    Run a single classification experiment with specified parameters.
+    Run a single experiment with specified parameters.
+    This version aggregates all data, trains one model, and evaluates once.
     """
     
     # Setup paths and device
@@ -872,54 +808,60 @@ def run_experiment(args):
     }
     input_dim = args.n_mels * args.frames
 
-    # --- 1. GET CLASSIFICATION DATA ---
-    logging.info("Preparing classification data for normal vs abnormal...")
-    train_files, train_labels, eval_files, eval_labels, label_to_name = get_classification_file_lists(
-        Path(args.base_dir)
-    )
-    
-    num_classes = len(label_to_name)
-    logging.info(f"Number of classes: {num_classes}")
-    logging.info(f"Classes: {label_to_name}")
-    logging.info(f"Training files: {len(train_files)}")
-    logging.info(f"Evaluation files: {len(eval_files)}")
+    # --- 1. AGGREGATE DATA from all sub-datasets ---
+    logging.info("Aggregating data from all sub-datasets...")
+    target_dirs = [p for p in Path(args.base_dir).glob("*/*/*")
+                   if p.is_dir() and (p / "normal").exists() and (p / "abnormal").exists()]
 
-    # --- 2. PREPARE TRAINING DATA ---
-    pickle_filename = f"train_data_normal_vs_abnormal_{args.model}_{args.n_mels}mels_{args.frames}frames.pkl"
+    if not target_dirs:
+        logging.error(f"No valid sub-directories with normal/ and abnormal/ folders found in {args.base_dir}")
+        return []
+
+    all_train_files, all_eval_files, all_eval_labels = [], [], []
+    for target_dir in tqdm(target_dirs, desc="Scanning directories"):
+        try:
+            train_files, eval_files, eval_labels = get_file_lists(target_dir)
+            all_train_files.extend(train_files)
+            all_eval_files.extend(eval_files)
+            all_eval_labels.extend(eval_labels)
+        except IOError as e:
+            logging.warning(f"Skipping directory {target_dir}: {e}")
+            continue
+
+    if not all_train_files or not all_eval_files:
+        logging.error("No training or evaluation data found across all directories. Exiting.")
+        return []
+
+    logging.info(f"Total training files found: {len(all_train_files)}")
+    logging.info(f"Total evaluation files found: {len(all_eval_files)}")
+
+    # --- 2. PREPARE UNIFIED TRAINING DATA ---
+    pickle_filename = f"train_data_all_{args.n_mels}mels_{args.frames}frames.pkl"
     train_pickle_file = pickle_path / pickle_filename
     
     if train_pickle_file.exists() and not args.retrain:
         logging.info(f"Loading cached training data from {train_pickle_file}")
         with open(train_pickle_file, "rb") as f:
-            train_data, train_labels_array = pickle.load(f)
+            train_data = pickle.load(f)
     else:
-        logging.info("Generating training data from audio files...")
-        train_data = list_to_vector_array(train_files, "Generating train vectors", **feat_params)
-        
-        # Create labels array matching the training data
-        train_labels_array = []
-        for file_path, label in zip(train_files, train_labels):
-            vectors = file_to_vector_array(file_path, **feat_params)
-            train_labels_array.extend([label] * len(vectors))
-        
-        train_labels_array = np.array(train_labels_array)
-        
+        logging.info("Generating aggregated training data from all audio files...")
+        train_data = list_to_vector_array(all_train_files, "Generating combined train vectors", **feat_params)
         with open(train_pickle_file, "wb") as f:
-            pickle.dump((train_data, train_labels_array), f)
+            pickle.dump(train_data, f)
 
-    # --- 3. TRAIN THE MODEL ---
+    # --- 3. TRAIN A SINGLE MODEL ---
     logging.info(f"\n{'='*50}")
-    logging.info(f"Training classification model '{args.model}' for normal vs abnormal")
+    logging.info(f"Training single model '{args.model}' on the entire dataset")
     logging.info(f"{'='*50}")
 
-    model = create_model(args.model, input_dim, num_classes, **feat_params)
-    model_file = model_path / f"model_{args.model}_normal_vs_abnormal.pth"
+    model = create_model(args.model, input_dim, **feat_params)
+    model_file = model_path / f"model_{args.model}_all_machines.pth"
     
     start_time = time.time()
     
-    if isinstance(model, SklearnClassifier):
+    if isinstance(model, SklearnAnomalyDetector):
         logging.info("Training sklearn model...")
-        model.fit(train_data, train_labels_array)
+        model.fit(train_data)
         training_time = time.time() - start_time
     else:
         model = model.to(device)
@@ -929,10 +871,7 @@ def run_experiment(args):
             training_time = 0.0
         else:
             logging.info("Training PyTorch model...")
-            dataset = TensorDataset(
-                torch.from_numpy(train_data).float(),
-                torch.from_numpy(train_labels_array).long()
-            )
+            dataset = TensorDataset(torch.from_numpy(train_data).float())
             val_size = int(len(dataset) * args.val_split)
             train_size = len(dataset) - val_size
             train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -940,46 +879,41 @@ def run_experiment(args):
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
             val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True)
 
-            history = train_pytorch_classifier(model, train_loader, val_loader, args, device, num_classes)
+            history = train_pytorch_model(model, train_loader, val_loader, args, device)
             training_time = time.time() - start_time
             torch.save(model.state_dict(), model_file)
     
-    # --- 4. EVALUATE THE MODEL ---
-    logging.info("Evaluating model...")
-    if isinstance(model, SklearnClassifier):
-        eval_results = evaluate_sklearn_classifier(model, eval_files, eval_labels, feat_params, label_to_name)
+    # --- 4. EVALUATE THE MODEL ONCE ---
+    logging.info("Evaluating model on the entire aggregated dataset...")
+    if isinstance(model, SklearnAnomalyDetector):
+        eval_results = evaluate_sklearn_model(model, all_eval_files, all_eval_labels, feat_params)
     else:
-        eval_results = evaluate_pytorch_classifier(model, eval_files, eval_labels, feat_params, device, label_to_name)
+        eval_results = evaluate_pytorch_model(model, all_eval_files, all_eval_labels, feat_params, device)
     
-    efficiency_metrics = measure_model_efficiency(model, input_dim, device, model_file if not isinstance(model, SklearnClassifier) else None)
+    efficiency_metrics = measure_model_efficiency(model, input_dim, device, model_file if not isinstance(model, SklearnAnomalyDetector) else None)
     
-    # --- 5. COLLECT RESULTS ---
+    # --- 5. COLLECT AND REPORT ONE SET OF RESULTS ---
     result_entry = {
         'model': args.model,
-        'classification_type': args.classification_type,
-        'num_classes': num_classes,
-        'accuracy': eval_results['accuracy'],
-        'precision': eval_results['precision'],
-        'recall': eval_results['recall'],
-        'f1': eval_results['f1'],
+        'dataset_scope': 'all_machines',
+        'auc': eval_results['auc'],
+        'pr_auc': eval_results['pr_auc'],
         'training_time_sec': training_time,
         **efficiency_metrics,
         'n_mels': args.n_mels, 'frames': args.frames, 'n_fft': args.n_fft, 'hop_length': args.hop_length,
         'power': args.power, 'epochs': args.epochs, 'batch_size': args.batch_size, 'learning_rate': args.learning_rate,
         'val_split': args.val_split,
-        'train_files': len(train_files), 'eval_files': len(eval_files), 'train_samples': len(train_data),
+        'train_files': len(all_train_files), 'eval_files': len(all_eval_files), 'train_samples': len(train_data),
     }
     
-    logging.info(f"\n--- Results for {args.model} on {args.classification_type} ---")
-    logging.info(f"  Accuracy: {eval_results['accuracy']:.4f}")
-    logging.info(f"  Precision: {eval_results['precision']:.4f}")
-    logging.info(f"  Recall: {eval_results['recall']:.4f}")
-    logging.info(f"  F1-Score: {eval_results['f1']:.4f}")
+    logging.info(f"\n--- Overall Results for {args.model} ---")
+    logging.info(f"  AUC: {eval_results['auc']:.4f}")
+    logging.info(f"  PR-AUC: {eval_results['pr_auc']:.4f}")
     logging.info(f"  Training time: {training_time:.2f}s")
     logging.info(f"  Model size: {efficiency_metrics['model_size_mb']:.2f}MB")
     logging.info(f"  Parameters: {efficiency_metrics['num_parameters']:,}")
     
-    return [result_entry]
+    return [result_entry] # Return as a list with one item
 
 def save_results_to_csv(results: List[Dict], output_file: Path):
     """Save experiment results to CSV file, appending if the file exists."""
@@ -1001,11 +935,11 @@ def save_results_to_csv(results: List[Dict], output_file: Path):
     logging.info(f"Results appended to {output_file}")
 
 def run_all_models_experiment(args):
-    """Run experiments for all baseline classification models."""
+    """Run experiments for all baseline models."""
     all_models = [
-        'simple_classifier', 'deep_classifier', 'vae_classifier', 'conv_classifier', 'lstm_classifier',
-        'attention_classifier', 'residual_classifier', 'denoising_classifier', 
-         'ss_classifier'
+        'simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
+        'attention_ae', 'residual_ae', 'denoising_ae', 
+        'isolation_forest', 'ss_ae'
     ]
     
     all_experiment_results = []
@@ -1032,33 +966,27 @@ def run_all_models_experiment(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Research Classification Experiments Runner for MIMII Dataset - 11 Baseline Models",
+        description="Research Experiments Runner for MIMII Dataset - 10 Baseline Models",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     # Dataset and paths
     parser.add_argument("--base_dir", type=str, required=True, 
                         help="Base directory of the MIMII dataset")
-    parser.add_argument("--pickle_dir", type=str, default="./research_classification_pickle_data", 
+    parser.add_argument("--pickle_dir", type=str, default="./cache/research_features", 
                         help="Directory for cached feature data")
-    parser.add_argument("--model_dir", type=str, default="./research_classification_models", 
+    parser.add_argument("--model_dir", type=str, default="./cache/research_models", 
                         help="Directory to save trained models")
-    parser.add_argument("--result_dir", type=str, default="./research_classification_results", 
+    parser.add_argument("--result_dir", type=str, default="./results", 
                         help="Directory to save results")
-    parser.add_argument("--output_csv", type=str, default="research_classification_results.csv",
+    parser.add_argument("--output_csv", type=str, default="research_results.csv",
                         help="Output CSV file for results")
-    
-    # Classification type
-    parser.add_argument("--classification_type", type=str, 
-                        choices=['machine_type', 'machine_id'],
-                        default='machine_type',
-                        help="Type of classification: machine_type (fan/pump/valve/slider) or machine_id (individual machines)")
     
     # Model selection
     parser.add_argument("--model", type=str, 
-                        choices=['simple_classifier', 'deep_classifier', 'vae_classifier', 'conv_classifier', 'lstm_classifier',
-                                 'attention_classifier', 'residual_classifier', 'denoising_classifier', 
-                                 'random_forest', 'svm', 'ss_classifier', 'all'],
+                        choices=['simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
+                                 'attention_ae', 'residual_ae', 'denoising_ae', 
+                                 'isolation_forest', 'one_class_svm', 'ss_ae','all'],
                         default='all',
                         help="Model to train and evaluate")
     
@@ -1102,10 +1030,9 @@ def main():
     Path(args.result_dir).mkdir(exist_ok=True, parents=True)
     
     logging.info("="*60)
-    logging.info("MIMII DATASET CLASSIFICATION EXPERIMENTS")
+    logging.info("MIMII DATASET RESEARCH EXPERIMENTS (UNIFIED TRAINING)")
     logging.info("="*60)
     logging.info(f"Base directory: {args.base_dir}")
-    logging.info(f"Classification type: {args.classification_type}")
     logging.info(f"Model(s): {args.model}")
     logging.info(f"Feature params: n_mels={args.n_mels}, frames={args.frames}")
     logging.info(f"Training params: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
@@ -1132,17 +1059,18 @@ def main():
         logging.info("EXPERIMENT SUMMARY")
         logging.info("="*60)
         
+        # Simple printout since each model now has one aggregated score
         for result in results:
             model_name = result['model']
-            accuracy = result['accuracy']
-            f1_score = result['f1']
-            logging.info(f"{model_name:20s}: Accuracy = {accuracy:.4f} | F1 = {f1_score:.4f}")
+            auc_score = result['auc']
+            pr_auc_score = result['pr_auc']
+            logging.info(f"{model_name:17s}: AUC = {auc_score:.4f} | PR-AUC = {pr_auc_score:.4f}")
         
         logging.info(f"\nTotal experiments completed: {len(results)}")
         logging.info(f"Total run time: {total_time:.2f} seconds")
         logging.info(f"Results saved to: {output_path}")
     
-    logging.info("Classification experiments completed successfully!")
+    logging.info("Experiments completed successfully!")
 
 if __name__ == "__main__":
     main()
