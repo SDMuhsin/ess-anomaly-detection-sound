@@ -9,3 +9,6 @@ research_results
 research_models
 research_pickle_data
 **.log
+**data/
+**models/
+**results/
