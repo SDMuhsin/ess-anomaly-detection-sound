@@ -39,126 +39,250 @@ logging.basicConfig(
 # Classification Model Definitions
 ########################################################################
 
-class SimpleClassifier(nn.Module):
-    """Simple 3-layer classifier (baseline)"""
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
-        )
-
-    def forward(self, x):
-        return self.classifier(x)
-
-class DeepClassifier(nn.Module):
-    """Deep classifier with multiple hidden layers"""
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(16, num_classes),
-        )
-
-    def forward(self, x):
-        return self.classifier(x)
-
-class VariationalClassifier(nn.Module):
-    """Variational classifier with probabilistic latent space"""
-    def __init__(self, input_dim, num_classes, latent_dim=16):
-        super().__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-        self.fc_mu = nn.Linear(64, latent_dim)
-        self.fc_logvar = nn.Linear(64, latent_dim)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
-        )
-
-    def encode(self, x):
-        h = self.encoder(x)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        output = self.classifier(z)
-        return output, mu, logvar
-
-class ConvClassifier(nn.Module):
-    """Convolutional classifier for spectral features"""
+class MobileNetV2Classifier(nn.Module):
+    """MobileNetV2-inspired classifier for audio spectrograms"""
     def __init__(self, input_dim, num_classes, n_mels=64, frames=5):
         super().__init__()
         self.n_mels = n_mels
         self.frames = frames
         self.input_dim = input_dim
         
-        # Convolutional layers
+        # Depthwise separable convolution block
+        def depthwise_separable_conv(in_channels, out_channels, stride=1):
+            return nn.Sequential(
+                # Depthwise convolution
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, 
+                         padding=1, groups=in_channels, bias=False),
+                nn.BatchNorm2d(in_channels),
+                nn.ReLU6(inplace=True),
+                # Pointwise convolution
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU6(inplace=True)
+            )
+        
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+        
+        # Depthwise separable convolutions
+        self.conv2 = depthwise_separable_conv(32, 64)
+        self.conv3 = depthwise_separable_conv(64, 128, stride=2)
+        self.conv4 = depthwise_separable_conv(128, 128)
+        self.conv5 = depthwise_separable_conv(128, 256, stride=2)
+        
+        # Global average pooling
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = x.view(batch_size, 1, self.n_mels, self.frames)
+        
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        
+        x = self.global_pool(x)
+        x = x.view(batch_size, -1)
+        x = self.classifier(x)
+        
+        return x
+
+class EfficientNetB0Classifier(nn.Module):
+    """EfficientNet-B0 inspired classifier for audio spectrograms"""
+    def __init__(self, input_dim, num_classes, n_mels=64, frames=5):
+        super().__init__()
+        self.n_mels = n_mels
+        self.frames = frames
+        self.input_dim = input_dim
+        
+        # Squeeze-and-Excitation block
+        class SEBlock(nn.Module):
+            def __init__(self, channels, reduction=16):
+                super().__init__()
+                self.squeeze = nn.AdaptiveAvgPool2d(1)
+                self.excitation = nn.Sequential(
+                    nn.Linear(channels, channels // reduction, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(channels // reduction, channels, bias=False),
+                    nn.Sigmoid()
+                )
+            
+            def forward(self, x):
+                b, c, _, _ = x.size()
+                y = self.squeeze(x).view(b, c)
+                y = self.excitation(y).view(b, c, 1, 1)
+                return x * y.expand_as(x)
+        
+        # MBConv block (Mobile Inverted Bottleneck)
+        def mbconv_block(in_channels, out_channels, expand_ratio=6, stride=1):
+            hidden_dim = in_channels * expand_ratio
+            return nn.Sequential(
+                # Expansion
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.SiLU(inplace=True),
+                # Depthwise
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride=stride, padding=1, 
+                         groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.SiLU(inplace=True),
+                # SE block
+                SEBlock(hidden_dim),
+                # Projection
+                nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True)
+        )
+        
+        # MBConv blocks
+        self.blocks = nn.Sequential(
+            mbconv_block(32, 16, expand_ratio=1, stride=1),
+            mbconv_block(16, 24, expand_ratio=6, stride=2),
+            mbconv_block(24, 40, expand_ratio=6, stride=2),
+            mbconv_block(40, 80, expand_ratio=6, stride=1),
+            mbconv_block(80, 112, expand_ratio=6, stride=1),
+        )
+        
+        # Head
+        self.head = nn.Sequential(
+            nn.Conv2d(112, 320, 1, bias=False),
+            nn.BatchNorm2d(320),
+            nn.SiLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Dropout(0.2)
+        )
+        
+        self.classifier = nn.Linear(320, num_classes)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = x.view(batch_size, 1, self.n_mels, self.frames)
+        
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.head(x)
+        x = x.view(batch_size, -1)
+        x = self.classifier(x)
+        
+        return x
+
+class AudioTransformerClassifier(nn.Module):
+    """Vision Transformer adapted for audio spectrograms"""
+    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, patch_size=8, embed_dim=192, num_heads=3, num_layers=6):
+        super().__init__()
+        self.n_mels = n_mels
+        self.frames = frames
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        
+        # Calculate number of patches
+        self.num_patches_h = n_mels // patch_size
+        self.num_patches_w = frames // patch_size
+        self.num_patches = self.num_patches_h * self.num_patches_w
+        
+        # Patch embedding
+        self.patch_embed = nn.Conv2d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        # Positional embedding
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim*4,
+            dropout=0.1, activation='gelu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Classification head
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = x.view(batch_size, 1, self.n_mels, self.frames)
+        
+        # Patch embedding
+        x = self.patch_embed(x)  # (B, embed_dim, num_patches_h, num_patches_w)
+        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        
+        # Add class token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        # Add positional embedding
+        x = x + self.pos_embed
+        
+        # Transformer
+        x = self.transformer(x)
+        
+        # Classification
+        cls_output = x[:, 0]  # Use class token
+        x = self.norm(cls_output)
+        x = self.classifier(x)
+        
+        return x
+
+class ConvClassifier(nn.Module):
+    """Improved Convolutional classifier for spectral features"""
+    def __init__(self, input_dim, num_classes, n_mels=64, frames=5):
+        super().__init__()
+        self.n_mels = n_mels
+        self.frames = frames
+        self.input_dim = input_dim
+        
+        # Convolutional layers with batch normalization
         self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(0.2),
+            nn.Dropout2d(0.25),
+            
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(0.25),
+            
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((4, 4)),
         )
         
         # Calculate flattened size
-        self.flat_size = 64 * 4 * 4
+        self.flat_size = 128 * 4 * 4
         
-        # Classifier
+        # Classifier with batch normalization
         self.classifier = nn.Sequential(
-            nn.Linear(self.flat_size, 128),
+            nn.Linear(self.flat_size, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, num_classes),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
@@ -173,170 +297,146 @@ class ConvClassifier(nn.Module):
         output = self.classifier(flat)
         return output
 
-class LSTMClassifier(nn.Module):
-    """LSTM-based classifier for temporal patterns"""
-    def __init__(self, input_dim, num_classes, hidden_dim=64, num_layers=2):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        
-        # LSTM layers
-        self.lstm = nn.LSTM(1, hidden_dim, num_layers, batch_first=True, dropout=0.2)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
-        )
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = x.unsqueeze(-1)  # Add feature dimension
-        
-        # LSTM processing
-        lstm_out, (hidden, _) = self.lstm(x)
-        
-        # Use last hidden state for classification
-        last_hidden = hidden[-1]  # Take last layer's hidden state
-        
-        # Classification
-        output = self.classifier(last_hidden)
-        return output
-
-class AttentionClassifier(nn.Module):
-    """Classifier with attention mechanism"""
-    def __init__(self, input_dim, num_classes, hidden_dim=128):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        # Feature encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-        
-        # Attention mechanism
-        self.attention = nn.MultiheadAttention(64, num_heads=8, batch_first=True, dropout=0.1)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(32, num_classes),
-        )
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        
-        # Encode features
-        encoded = self.encoder(x)
-        
-        # Reshape for attention (treat features as sequence)
-        encoded = encoded.unsqueeze(1)  # Add sequence dimension
-        
-        # Apply attention
-        attended, _ = self.attention(encoded, encoded, encoded)
-        attended = attended.squeeze(1)
-        
-        # Classification
-        output = self.classifier(attended)
-        return output
-
-class ResidualClassifier(nn.Module):
-    """Classifier with residual connections"""
+class ResNet1DClassifier(nn.Module):
+    """1D ResNet for audio classification"""
     def __init__(self, input_dim, num_classes):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, 128)
+        self.input_dim = input_dim
         
-        # Residual blocks
-        self.res_block1 = self._make_residual_block(128, 128)
-        self.res_block2 = self._make_residual_block(128, 64)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, num_classes),
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
         )
-
-    def _make_residual_block(self, in_dim, out_dim):
+        
+        # ResNet blocks
+        self.layer1 = self._make_layer(64, 64, 2, stride=1)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2)
+        self.layer3 = self._make_layer(128, 256, 2, stride=2)
+        
+        # Global average pooling and classifier
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, num_classes)
+        
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        layers = []
+        
+        # First block (may have stride > 1)
+        layers.append(self._basic_block(in_channels, out_channels, stride))
+        
+        # Remaining blocks
+        for _ in range(1, blocks):
+            layers.append(self._basic_block(out_channels, out_channels, 1))
+            
+        return nn.Sequential(*layers)
+    
+    def _basic_block(self, in_channels, out_channels, stride):
         return nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(out_dim, out_dim),
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm1d(out_channels),
         )
 
     def forward(self, x):
-        # Initial projection
-        x = F.relu(self.input_proj(x))
+        batch_size = x.size(0)
+        x = x.unsqueeze(1)  # Add channel dimension
         
-        # Residual blocks
-        residual = x
-        x = self.res_block1(x)
-        if x.size(-1) == residual.size(-1):
-            x = x + residual
-        x = F.relu(x)
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
         
-        x = self.res_block2(x)
-        x = F.relu(x)
+        x = self.avgpool(x)
+        x = x.view(batch_size, -1)
+        x = self.fc(x)
         
-        # Classification
-        output = self.classifier(x)
-        return output
-
-class DenoisingClassifier(nn.Module):
-    """Denoising classifier with noise injection during training"""
-    def __init__(self, input_dim, num_classes, noise_factor=0.1):
-        super().__init__()
-        self.noise_factor = noise_factor
-        
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(16, num_classes),
-        )
-
-    def add_noise(self, x):
-        if self.training:
-            noise = torch.randn_like(x) * self.noise_factor
-            return x + noise
         return x
 
+class WaveNetClassifier(nn.Module):
+    """WaveNet-inspired classifier for audio"""
+    def __init__(self, input_dim, num_classes, num_layers=8, num_blocks=3, dilation_channels=64, residual_channels=32):
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_layers = num_layers
+        self.num_blocks = num_blocks
+        
+        # Initial convolution
+        self.start_conv = nn.Conv1d(1, residual_channels, kernel_size=1)
+        
+        # Dilated convolution blocks
+        self.dilated_convs = nn.ModuleList()
+        self.residual_convs = nn.ModuleList()
+        self.skip_convs = nn.ModuleList()
+        
+        for block in range(num_blocks):
+            for layer in range(num_layers):
+                dilation = 2 ** layer
+                
+                # Dilated convolution - output channels must be even for gated activation
+                self.dilated_convs.append(
+                    nn.Conv1d(residual_channels, dilation_channels, kernel_size=2, 
+                             dilation=dilation, padding=dilation)
+                )
+                
+                # Residual connection - input is half of dilation_channels due to gating
+                self.residual_convs.append(
+                    nn.Conv1d(dilation_channels // 2, residual_channels, kernel_size=1)
+                )
+                
+                # Skip connection - input is half of dilation_channels due to gating
+                self.skip_convs.append(
+                    nn.Conv1d(dilation_channels // 2, residual_channels, kernel_size=1)
+                )
+        
+        # Final layers
+        self.end_conv1 = nn.Conv1d(residual_channels, residual_channels, kernel_size=1)
+        self.end_conv2 = nn.Conv1d(residual_channels, residual_channels, kernel_size=1)
+        
+        # Global pooling and classifier
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Linear(residual_channels, num_classes)
+
     def forward(self, x):
-        noisy_x = self.add_noise(x)
-        features = self.feature_extractor(noisy_x)
-        output = self.classifier(features)
-        return output
+        batch_size = x.size(0)
+        x = x.unsqueeze(1)  # Add channel dimension
+        
+        x = self.start_conv(x)
+        skip_connections = []
+        
+        for i in range(len(self.dilated_convs)):
+            # Dilated convolution
+            conv_out = self.dilated_convs[i](x)
+            
+            # Gated activation - split channels in half
+            tanh_out = torch.tanh(conv_out[:, :conv_out.size(1)//2, :])
+            sigmoid_out = torch.sigmoid(conv_out[:, conv_out.size(1)//2:, :])
+            gated_out = tanh_out * sigmoid_out
+            
+            # Residual connection
+            residual = self.residual_convs[i](gated_out)
+            x = x + residual
+            
+            # Skip connection
+            skip = self.skip_convs[i](gated_out)
+            skip_connections.append(skip)
+        
+        # Sum skip connections
+        x = sum(skip_connections)
+        x = F.relu(x)
+        x = self.end_conv1(x)
+        x = F.relu(x)
+        x = self.end_conv2(x)
+        
+        # Global pooling and classification
+        x = self.global_pool(x)
+        x = x.view(batch_size, -1)
+        x = self.classifier(x)
+        
+        return x
 
 ########################################################################
 # Classical ML Models (Sklearn-based)
@@ -365,12 +465,16 @@ class SklearnClassifier:
 
 class SpectralShapeClassifier(nn.Module):
     """
-    Classification equivalent of SpectralShapeAutoencoder (ss_ae).
-    This version processes each spectral slice within the time-frequency
-    window using a shared-weight projection, then uses a normalized basis
-    for efficient feature extraction before classification.
+    Enhanced Spectral Shape Classifier - Improved version with better architecture
+    while maintaining the core spectral slice processing innovation.
+    
+    Key improvements:
+    1. Multi-scale slice processing with different receptive fields
+    2. Attention mechanism for slice importance weighting
+    3. Hierarchical feature fusion
+    4. Better regularization and normalization
     """
-    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, latent_dim=32, slice_latent_dim=64):
+    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, latent_dim=64, slice_latent_dim=96):
         super().__init__()
         self.n_mels = n_mels
         self.frames = frames
@@ -379,59 +483,118 @@ class SpectralShapeClassifier(nn.Module):
         self.input_dim = input_dim
         self.num_classes = num_classes
         
-        # Combined dimension after processing each slice
-        self.combined_dim = frames * slice_latent_dim
-
-        # === FEATURE EXTRACTOR ===
-        # A shared linear layer to process each of the 5 spectral slices
-        self.slice_encoder = nn.Sequential(
+        # === MULTI-SCALE SLICE PROCESSING ===
+        # Process slices at different scales for richer representations
+        self.slice_encoder_fine = nn.Sequential(
             nn.LayerNorm(n_mels),
-            nn.Linear(n_mels, slice_latent_dim),
-            nn.GELU()
+            nn.Linear(n_mels, slice_latent_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1)
         )
         
-        # The core learnable basis, operating on the combined representation
-        self.global_basis = nn.Parameter(torch.randn(latent_dim, self.combined_dim))
-        nn.init.xavier_uniform_(self.global_basis)
+        self.slice_encoder_coarse = nn.Sequential(
+            nn.LayerNorm(n_mels),
+            nn.Linear(n_mels, slice_latent_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
         
-        # A final non-linear step in the bottleneck for added capacity
+        # === ATTENTION MECHANISM FOR SLICE IMPORTANCE ===
+        self.slice_attention = nn.MultiheadAttention(
+            embed_dim=slice_latent_dim, 
+            num_heads=4, 
+            dropout=0.1, 
+            batch_first=True
+        )
+        
+        # === HIERARCHICAL FEATURE FUSION ===
+        # First level: local slice interactions
+        self.local_fusion = nn.Sequential(
+            nn.Linear(slice_latent_dim, slice_latent_dim),
+            nn.LayerNorm(slice_latent_dim),
+            nn.GELU(),
+            nn.Dropout(0.15)
+        )
+        
+        # Second level: global representation
+        combined_dim = frames * slice_latent_dim
+        
+        # Learnable basis with improved initialization
+        self.global_basis = nn.Parameter(torch.randn(latent_dim, combined_dim))
+        nn.init.orthogonal_(self.global_basis)  # Better initialization
+        
+        # Enhanced bottleneck with residual connection
+        self.bottleneck_proj = nn.Linear(combined_dim, latent_dim)
         self.bottleneck_mlp = nn.Sequential(
             nn.LayerNorm(latent_dim),
-            nn.Linear(latent_dim, latent_dim),
+            nn.Linear(latent_dim, latent_dim * 2),
             nn.GELU(),
-            nn.Dropout(0.2)
+            nn.Dropout(0.2),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim)
         )
 
-        # === CLASSIFIER ===
-        # Classification head
+        # === ENHANCED CLASSIFIER ===
         self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
             nn.Dropout(0.3),
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
             nn.Linear(latent_dim // 2, num_classes),
         )
 
     def forward(self, x):
+        batch_size = x.size(0)
         # x shape: (B, n_mels * frames)
         # Reshape to process each slice: (B, frames, n_mels)
-        x_slices = x.view(-1, self.frames, self.n_mels)
+        x_slices = x.view(batch_size, self.frames, self.n_mels)
         
-        # 1. Encode each slice using the shared encoder
-        encoded_slices = self.slice_encoder(x_slices)
+        # === MULTI-SCALE SLICE ENCODING ===
+        # Fine-grained features
+        fine_features = self.slice_encoder_fine(x_slices)
         
-        # 2. Concatenate slice representations into a single vector
-        combined_vec = encoded_slices.view(-1, self.combined_dim)
+        # Coarse-grained features (with slight perturbation for diversity)
+        coarse_input = x_slices + 0.01 * torch.randn_like(x_slices) if self.training else x_slices
+        coarse_features = self.slice_encoder_coarse(coarse_input)
         
-        # 3. Normalize the global basis for stability
+        # Combine multi-scale features
+        encoded_slices = torch.cat([fine_features, coarse_features], dim=-1)
+        
+        # === ATTENTION-BASED SLICE WEIGHTING ===
+        # Self-attention to weight slice importance
+        attended_slices, attention_weights = self.slice_attention(
+            encoded_slices, encoded_slices, encoded_slices
+        )
+        
+        # === LOCAL FEATURE FUSION ===
+        # Process attended slices with local interactions
+        fused_slices = self.local_fusion(attended_slices)
+        
+        # === GLOBAL REPRESENTATION LEARNING ===
+        # Flatten for global processing
+        combined_vec = fused_slices.view(batch_size, -1)
+        
+        # Normalize the global basis for stability
         normalized_basis = F.normalize(self.global_basis, p=2, dim=1)
         
-        # 4. Project onto the global basis to get the final latent code
-        latent_code = torch.matmul(combined_vec, normalized_basis.T)
+        # Project onto the global basis
+        basis_projection = torch.matmul(combined_vec, normalized_basis.T)
         
-        # 5. Pass through bottleneck MLP for more capacity
-        features = self.bottleneck_mlp(latent_code)
+        # Direct projection for residual connection
+        direct_projection = self.bottleneck_proj(combined_vec)
+        
+        # Combine basis projection with direct projection (residual-like)
+        latent_code = basis_projection + 0.5 * direct_projection
+        
+        # Enhanced bottleneck processing with residual connection
+        bottleneck_output = self.bottleneck_mlp(latent_code)
+        features = latent_code + bottleneck_output  # Residual connection
 
-        # 6. Classification
+        # === CLASSIFICATION ===
         output = self.classifier(features)
         
         return output
@@ -526,10 +689,7 @@ def get_classification_file_lists(base_dir: Path) -> tuple:
 
 def train_pytorch_classifier(model, train_loader, val_loader, args, device, num_classes):
     """Trains PyTorch classification models"""
-    if isinstance(model, VariationalClassifier):
-        return train_variational_classifier(model, train_loader, val_loader, args, device, num_classes)
-    else:
-        return train_standard_classifier(model, train_loader, val_loader, args, device, num_classes)
+    return train_standard_classifier(model, train_loader, val_loader, args, device, num_classes)
 
 def train_standard_classifier(model, train_loader, val_loader, args, device, num_classes):
     """Train standard classification models"""
@@ -691,10 +851,7 @@ def evaluate_pytorch_classifier(model, eval_files, eval_labels, feat_params, dev
 
             data = torch.from_numpy(vectors).float().to(device)
             
-            if isinstance(model, VariationalClassifier):
-                outputs, _, _ = model(data)
-            else:
-                outputs = model(data)
+            outputs = model(data)
             
             # Average predictions across all frames
             probs = F.softmax(outputs, dim=1)
@@ -780,10 +937,7 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
     # Warm up
     with torch.no_grad():
         for _ in range(10):
-            if isinstance(model, VariationalClassifier):
-                _ = model(test_data[:10])
-            else:
-                _ = model(test_data[:10])
+            _ = model(test_data[:10])
     
     # Measure inference time
     if device.type == 'cuda':
@@ -791,10 +945,7 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
     
     start_time = time.time()
     with torch.no_grad():
-        if isinstance(model, VariationalClassifier):
-            outputs, _, _ = model(test_data)
-        else:
-            outputs = model(test_data)
+        outputs = model(test_data)
     
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -825,25 +976,34 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
 def create_model(model_name: str, input_dim: int, num_classes: int, **kwargs):
     """Factory function to create classification models"""
     models = {
-        'simple_classifier': SimpleClassifier,
-        'deep_classifier': DeepClassifier,
-        'vae_classifier': VariationalClassifier,
+        # Modern audio classification architectures
+        'mobilenet_v2': MobileNetV2Classifier,
+        'efficientnet_b0': EfficientNetB0Classifier,
+        'audio_transformer': AudioTransformerClassifier,
         'conv_classifier': ConvClassifier,
-        'lstm_classifier': LSTMClassifier,
-        'attention_classifier': AttentionClassifier,
-        'residual_classifier': ResidualClassifier,
-        'denoising_classifier': DenoisingClassifier,
-        'random_forest': lambda input_dim, num_classes, **kw: SklearnClassifier('random_forest', num_classes),
+        'resnet_1d': ResNet1DClassifier,
+        'wavenet': WaveNetClassifier,
+        
+        # Novel spectral shape classifier
         'ss_classifier': SpectralShapeClassifier,
+        
+        # Classical ML models
+        'random_forest': lambda input_dim, num_classes, **kw: SklearnClassifier('random_forest', num_classes),
+        'svm': lambda input_dim, num_classes, **kw: SklearnClassifier('svm', num_classes),
     }
     
     if model_name not in models:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(models.keys())}")
     
-    if model_name in ['conv_classifier', 'ss_classifier']:
+    # Models that need spectrogram dimensions
+    if model_name in ['mobilenet_v2', 'efficientnet_b0', 'audio_transformer', 'conv_classifier', 'ss_classifier']:
         n_mels = kwargs.get('n_mels', 64)
         frames = kwargs.get('frames', 5)
         return models[model_name](input_dim, num_classes, n_mels, frames)
+    # Models that only need input_dim and num_classes
+    elif model_name in ['resnet_1d', 'wavenet']:
+        return models[model_name](input_dim, num_classes)
+    # Sklearn models
     elif model_name in ['random_forest', 'svm']:
         return models[model_name](input_dim, num_classes)
     else:
@@ -1003,9 +1163,15 @@ def save_results_to_csv(results: List[Dict], output_file: Path):
 def run_all_models_experiment(args):
     """Run experiments for all baseline classification models."""
     all_models = [
-        'simple_classifier', 'deep_classifier', 'vae_classifier', 'conv_classifier', 'lstm_classifier',
-        'attention_classifier', 'residual_classifier', 'denoising_classifier', 
-         'ss_classifier'
+        # Modern audio classification architectures
+        'mobilenet_v2', 'efficientnet_b0', 'audio_transformer', 
+        'conv_classifier', 'resnet_1d', 'wavenet',
+        
+        # Novel spectral shape classifier
+        'ss_classifier',
+        
+        # Classical ML models
+        'random_forest', 'svm'
     ]
     
     all_experiment_results = []
@@ -1056,9 +1222,8 @@ def main():
     
     # Model selection
     parser.add_argument("--model", type=str, 
-                        choices=['simple_classifier', 'deep_classifier', 'vae_classifier', 'conv_classifier', 'lstm_classifier',
-                                 'attention_classifier', 'residual_classifier', 'denoising_classifier', 
-                                 'random_forest', 'svm', 'ss_classifier', 'all'],
+                        choices=['mobilenet_v2', 'efficientnet_b0', 'audio_transformer', 'conv_classifier', 
+                                 'resnet_1d', 'wavenet', 'ss_classifier', 'random_forest', 'svm', 'all'],
                         default='all',
                         help="Model to train and evaluate")
     
