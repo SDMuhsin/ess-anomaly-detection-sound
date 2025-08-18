@@ -1,0 +1,8 @@
+README.md
+setup.py
+spectral_shape_ae_cuda.cpp
+spectral_shape_ae_kernel.cu
+spectral_shape_ae_cuda.egg-info/PKG-INFO
+spectral_shape_ae_cuda.egg-info/SOURCES.txt
+spectral_shape_ae_cuda.egg-info/dependency_links.txt
+spectral_shape_ae_cuda.egg-info/top_level.txt

@@ -25,6 +25,14 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 import yaml
 
+# Import the CUDA extension (optional import to avoid breaking non-CUDA environments)
+try:
+    import spectral_shape_ae_cuda
+    CUDA_KERNEL_AVAILABLE = True
+except ImportError:
+    CUDA_KERNEL_AVAILABLE = False
+    print("Warning: CUDA kernel for SpectralShapeAutoencoder not available. Falling back to native implementation.")
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -434,6 +442,31 @@ class SpectralShapeAutoencoder(nn.Module):
         )
 
     def forward(self, x):
+        # If CUDA kernel is available and model is in eval mode on a CUDA tensor, use the kernel
+        if not self.training and CUDA_KERNEL_AVAILABLE and x.is_cuda:
+            try:
+                # Pre-normalize the basis once per call. This is more efficient.
+                normalized_basis = F.normalize(self.global_basis, p=2, dim=1)
+
+                # Call the C++ extension's 'forward' function
+                return spectral_shape_ae_cuda.forward(
+                    x.contiguous(),
+                    self.slice_encoder[0].weight.contiguous(),
+                    self.slice_encoder[0].bias.contiguous(),
+                    self.slice_encoder[1].weight.contiguous(),
+                    self.slice_encoder[1].bias.contiguous(),
+                    normalized_basis.contiguous(),
+                    self.bottleneck_mlp[0].weight.contiguous(),
+                    self.bottleneck_mlp[0].bias.contiguous(),
+                    self.bottleneck_mlp[1].weight.contiguous(),
+                    self.bottleneck_mlp[1].bias.contiguous(),
+                    self.slice_decoder[0].weight.contiguous(),
+                    self.slice_decoder[0].bias.contiguous()
+                )
+            except Exception as e:
+                print(f"CUDA kernel error: {e}. Falling back to native implementation.")
+        
+        # Fallback to the original Python implementation
         # x shape: (B, n_mels * frames)
         # Reshape to process each slice: (B, frames, n_mels)
         x_slices = x.view(-1, self.frames, self.n_mels)
@@ -453,8 +486,7 @@ class SpectralShapeAutoencoder(nn.Module):
         # 5. Pass through bottleneck MLP for more capacity
         latent_code = self.bottleneck_mlp(latent_code)
 
-        # 6. Reconstruct the combined vector using the same basis (or a separate linear layer)
-        # Using the basis maintains the tied-weight paradigm
+        # 6. Reconstruct the combined vector using the same basis
         reconstructed_combined = torch.matmul(latent_code, normalized_basis)
         
         # 7. Reshape back into slice-wise representations
@@ -752,6 +784,56 @@ def measure_model_efficiency(model, input_dim, device, model_path=None):
         'memory_usage_mb': memory_usage_mb
     }
 
+def benchmark_inference_time(model, input_dim, device, batch_size=256, num_runs=10000):
+    """Benchmark inference time per batch with statistics"""
+    if isinstance(model, SklearnAnomalyDetector):
+        return {
+            'batch_inference_time_ms_mean': 0.0,
+            'batch_inference_time_ms_std': 0.0,
+            'batch_size': batch_size
+        }
+    
+    model.eval()
+    test_data = torch.randn(batch_size, input_dim).to(device)
+    
+    # Warm up
+    with torch.no_grad():
+        for _ in range(1000):
+            if isinstance(model, VariationalAutoencoder):
+                _ = model(test_data)
+            else:
+                _ = model(test_data)
+    
+    # Measure inference times for multiple runs
+    inference_times = []
+    
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        start_time = time.time()
+        with torch.no_grad():
+            if isinstance(model, VariationalAutoencoder):
+                outputs, _, _ = model(test_data)
+            else:
+                outputs = model(test_data)
+        
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        end_time = time.time()
+        inference_times.append((end_time - start_time) * 1000)  # Convert to ms
+    
+    # Calculate statistics
+    mean_time = np.mean(inference_times)
+    std_time = np.std(inference_times)
+    
+    return {
+        'batch_inference_time_ms_mean': mean_time,
+        'batch_inference_time_ms_std': std_time,
+        'batch_size': batch_size
+    }
+
 ########################################################################
 # Model Factory
 ########################################################################
@@ -770,12 +852,13 @@ def create_model(model_name: str, input_dim: int, **kwargs):
         'isolation_forest': lambda input_dim, **kw: SklearnAnomalyDetector('isolation_forest'),
         'one_class_svm': lambda input_dim, **kw: SklearnAnomalyDetector('one_class_svm'),
         'ss_ae': SpectralShapeAutoencoder,
+        'ss_ae_cuda': SpectralShapeAutoencoder,  # Same model, CUDA usage is automatic
     }
     
     if model_name not in models:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(models.keys())}")
     
-    if model_name in ['conv_ae','ss_ae']:
+    if model_name in ['conv_ae','ss_ae','ss_ae_cuda']:
         n_mels = kwargs.get('n_mels', 64)
         frames = kwargs.get('frames', 5)
         return models[model_name](input_dim, n_mels, frames)
@@ -892,7 +975,11 @@ def run_experiment(args):
     
     efficiency_metrics = measure_model_efficiency(model, input_dim, device, model_file if not isinstance(model, SklearnAnomalyDetector) else None)
     
-    # --- 5. COLLECT AND REPORT ONE SET OF RESULTS ---
+    # --- 5. BENCHMARK INFERENCE TIME ---
+    logging.info("Benchmarking inference time...")
+    benchmark_results = benchmark_inference_time(model, input_dim, device, batch_size=args.batch_size, num_runs=100000)
+    
+    # --- 6. COLLECT AND REPORT ONE SET OF RESULTS ---
     result_entry = {
         'model': args.model,
         'dataset_scope': 'all_machines',
@@ -900,6 +987,7 @@ def run_experiment(args):
         'pr_auc': eval_results['pr_auc'],
         'training_time_sec': training_time,
         **efficiency_metrics,
+        **benchmark_results,
         'n_mels': args.n_mels, 'frames': args.frames, 'n_fft': args.n_fft, 'hop_length': args.hop_length,
         'power': args.power, 'epochs': args.epochs, 'batch_size': args.batch_size, 'learning_rate': args.learning_rate,
         'val_split': args.val_split,
@@ -912,6 +1000,7 @@ def run_experiment(args):
     logging.info(f"  Training time: {training_time:.2f}s")
     logging.info(f"  Model size: {efficiency_metrics['model_size_mb']:.2f}MB")
     logging.info(f"  Parameters: {efficiency_metrics['num_parameters']:,}")
+    logging.info(f"  Batch inference time: {benchmark_results['batch_inference_time_ms_mean']:.3f} ± {benchmark_results['batch_inference_time_ms_std']:.3f} ms (batch_size={benchmark_results['batch_size']})")
     
     return [result_entry] # Return as a list with one item
 
@@ -979,14 +1068,14 @@ def main():
                         help="Directory to save trained models")
     parser.add_argument("--result_dir", type=str, default="./results", 
                         help="Directory to save results")
-    parser.add_argument("--output_csv", type=str, default="autoencoding_results.csv",
+    parser.add_argument("--output_csv", type=str, default="research_results.csv",
                         help="Output CSV file for results")
     
     # Model selection
     parser.add_argument("--model", type=str, 
                         choices=['simple_ae', 'deep_ae', 'vae', 'conv_ae', 'lstm_ae',
                                  'attention_ae', 'residual_ae', 'denoising_ae', 
-                                 'isolation_forest', 'one_class_svm', 'ss_ae','all'],
+                                 'isolation_forest', 'one_class_svm', 'ss_ae', 'ss_ae_cuda', 'all'],
                         default='all',
                         help="Model to train and evaluate")
     

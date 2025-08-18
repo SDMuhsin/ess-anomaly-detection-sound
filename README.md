@@ -248,7 +248,7 @@ print(summary_cls.to_latex())
 ### Anomaly Detection (AUC ranges)
 - **Simple/Deep AE**: 0.55-0.65
 - **VAE**: 0.60-0.70
-- **Conv AE**: 0.65-0.75
+- **Conv AE**: 0.65-0.75 
 - **LSTM AE**: 0.60-0.70
 - **Attention AE**: 0.65-0.75
 - **Residual AE**: 0.60-0.70
