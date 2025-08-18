@@ -15,3 +15,8 @@ research_pickle_data/
 research_classification_models/
 research_classification_pickle_data/
 research_classification_results/
+
+src/cuda/**.o
+src/cuda/debug
+src/cuda/**.pt
+src/cuda/build
