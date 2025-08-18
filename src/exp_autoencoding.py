@@ -979,7 +979,7 @@ def main():
                         help="Directory to save trained models")
     parser.add_argument("--result_dir", type=str, default="./results", 
                         help="Directory to save results")
-    parser.add_argument("--output_csv", type=str, default="research_results.csv",
+    parser.add_argument("--output_csv", type=str, default="autoencoding_results.csv",
                         help="Output CSV file for results")
     
     # Model selection

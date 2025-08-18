@@ -52,7 +52,7 @@ class MobileNetV2Classifier(nn.Module):
             return nn.Sequential(
                 # Depthwise convolution
                 nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=stride, 
-                         padding=1, groups=in_channels, bias=False),
+                          padding=1, groups=in_channels, bias=False),
                 nn.BatchNorm2d(in_channels),
                 nn.ReLU6(inplace=True),
                 # Pointwise convolution
@@ -135,7 +135,7 @@ class EfficientNetB0Classifier(nn.Module):
                 nn.SiLU(inplace=True),
                 # Depthwise
                 nn.Conv2d(hidden_dim, hidden_dim, 3, stride=stride, padding=1, 
-                         groups=hidden_dim, bias=False),
+                          groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 nn.SiLU(inplace=True),
                 # SE block
@@ -186,12 +186,17 @@ class EfficientNetB0Classifier(nn.Module):
 
 class AudioTransformerClassifier(nn.Module):
     """Vision Transformer adapted for audio spectrograms"""
-    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, patch_size=8, embed_dim=192, num_heads=3, num_layers=6):
+    # FIXED: Changed default patch_size from 8 to 4 to be compatible with frames=5
+    def __init__(self, input_dim, num_classes, n_mels=64, frames=5, patch_size=4, embed_dim=192, num_heads=3, num_layers=6):
         super().__init__()
         self.n_mels = n_mels
         self.frames = frames
         self.patch_size = patch_size
         self.embed_dim = embed_dim
+        
+        # Check for compatibility
+        if frames < patch_size or n_mels < patch_size:
+            raise ValueError(f"patch_size ({patch_size}) must be smaller than or equal to n_mels ({n_mels}) and frames ({frames}).")
         
         # Calculate number of patches
         self.num_patches_h = n_mels // patch_size
@@ -297,6 +302,40 @@ class ConvClassifier(nn.Module):
         output = self.classifier(flat)
         return output
 
+# FIXED: Re-implemented ResNet1DClassifier with proper residual blocks
+class _BasicBlock1D(nn.Module):
+    """Basic residual block for 1D ResNet."""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        
+        # Downsample layer for skip connection if dimensions change
+        self.downsample = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = x
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += self.downsample(identity)
+        out = self.relu(out)
+        
+        return out
+
 class ResNet1DClassifier(nn.Module):
     """1D ResNet for audio classification"""
     def __init__(self, input_dim, num_classes):
@@ -320,26 +359,12 @@ class ResNet1DClassifier(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(256, num_classes)
         
-    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+    def _make_layer(self, in_channels, out_channels, blocks, stride):
         layers = []
-        
-        # First block (may have stride > 1)
-        layers.append(self._basic_block(in_channels, out_channels, stride))
-        
-        # Remaining blocks
+        layers.append(_BasicBlock1D(in_channels, out_channels, stride))
         for _ in range(1, blocks):
-            layers.append(self._basic_block(out_channels, out_channels, 1))
-            
+            layers.append(_BasicBlock1D(out_channels, out_channels, 1))
         return nn.Sequential(*layers)
-    
-    def _basic_block(self, in_channels, out_channels, stride):
-        return nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm1d(out_channels),
-        )
 
     def forward(self, x):
         batch_size = x.size(0)
@@ -379,7 +404,7 @@ class WaveNetClassifier(nn.Module):
                 # Dilated convolution - output channels must be even for gated activation
                 self.dilated_convs.append(
                     nn.Conv1d(residual_channels, dilation_channels, kernel_size=2, 
-                             dilation=dilation, padding=dilation)
+                              dilation=dilation, padding=dilation)
                 )
                 
                 # Residual connection - input is half of dilation_channels due to gating
@@ -405,11 +430,14 @@ class WaveNetClassifier(nn.Module):
         x = x.unsqueeze(1)  # Add channel dimension
         
         x = self.start_conv(x)
-        skip_connections = []
+        skip_connections = 0
         
         for i in range(len(self.dilated_convs)):
             # Dilated convolution
             conv_out = self.dilated_convs[i](x)
+            
+            # FIXED: Crop the output to match input length for residual connection
+            conv_out = conv_out[..., :x.size(-1)]
             
             # Gated activation - split channels in half
             tanh_out = torch.tanh(conv_out[:, :conv_out.size(1)//2, :])
@@ -422,11 +450,10 @@ class WaveNetClassifier(nn.Module):
             
             # Skip connection
             skip = self.skip_convs[i](gated_out)
-            skip_connections.append(skip)
+            skip_connections = skip_connections + skip
         
         # Sum skip connections
-        x = sum(skip_connections)
-        x = F.relu(x)
+        x = F.relu(skip_connections)
         x = self.end_conv1(x)
         x = F.relu(x)
         x = self.end_conv2(x)
@@ -999,7 +1026,7 @@ def create_model(model_name: str, input_dim: int, num_classes: int, **kwargs):
     if model_name in ['mobilenet_v2', 'efficientnet_b0', 'audio_transformer', 'conv_classifier', 'ss_classifier']:
         n_mels = kwargs.get('n_mels', 64)
         frames = kwargs.get('frames', 5)
-        return models[model_name](input_dim, num_classes, n_mels, frames)
+        return models[model_name](input_dim, num_classes, n_mels=n_mels, frames=frames)
     # Models that only need input_dim and num_classes
     elif model_name in ['resnet_1d', 'wavenet']:
         return models[model_name](input_dim, num_classes)
@@ -1045,7 +1072,7 @@ def run_experiment(args):
     logging.info(f"Evaluation files: {len(eval_files)}")
 
     # --- 2. PREPARE TRAINING DATA ---
-    pickle_filename = f"train_data_normal_vs_abnormal_{args.model}_{args.n_mels}mels_{args.frames}frames.pkl"
+    pickle_filename = f"train_data_normal_vs_abnormal_{args.n_mels}mels_{args.frames}frames.pkl"
     train_pickle_file = pickle_path / pickle_filename
     
     if train_pickle_file.exists() and not args.retrain:
@@ -1058,7 +1085,8 @@ def run_experiment(args):
         
         # Create labels array matching the training data
         train_labels_array = []
-        for file_path, label in zip(train_files, train_labels):
+        # Re-calculating vectors is inefficient but ensures labels match framed data
+        for file_path, label in tqdm(zip(train_files, train_labels), "Matching labels to frames", total=len(train_files)):
             vectors = file_to_vector_array(file_path, **feat_params)
             train_labels_array.extend([label] * len(vectors))
         
@@ -1073,7 +1101,9 @@ def run_experiment(args):
     logging.info(f"{'='*50}")
 
     model = create_model(args.model, input_dim, num_classes, **feat_params)
-    model_file = model_path / f"model_{args.model}_normal_vs_abnormal.pth"
+    
+    # FIXED: Add epochs to the model file name for uniqueness.
+    model_file = model_path / f"model_{args.model}_normal_vs_abnormal_{args.epochs}epochs.pth"
     
     start_time = time.time()
     
@@ -1116,7 +1146,7 @@ def run_experiment(args):
     # --- 5. COLLECT RESULTS ---
     result_entry = {
         'model': args.model,
-        'classification_type': args.classification_type,
+        'classification_type': 'normal_vs_abnormal', # Hardcoded as per implementation
         'num_classes': num_classes,
         'accuracy': eval_results['accuracy'],
         'precision': eval_results['precision'],
@@ -1130,7 +1160,7 @@ def run_experiment(args):
         'train_files': len(train_files), 'eval_files': len(eval_files), 'train_samples': len(train_data),
     }
     
-    logging.info(f"\n--- Results for {args.model} on {args.classification_type} ---")
+    logging.info(f"\n--- Results for {args.model} on normal_vs_abnormal ---")
     logging.info(f"  Accuracy: {eval_results['accuracy']:.4f}")
     logging.info(f"  Precision: {eval_results['precision']:.4f}")
     logging.info(f"  Recall: {eval_results['recall']:.4f}")
@@ -1168,10 +1198,7 @@ def run_all_models_experiment(args):
         'conv_classifier', 'resnet_1d', 'wavenet',
         
         # Novel spectral shape classifier
-        'ss_classifier',
-        
-        # Classical ML models
-        'random_forest', 'svm'
+        'ss_classifier'
     ]
     
     all_experiment_results = []
@@ -1214,11 +1241,11 @@ def main():
     parser.add_argument("--output_csv", type=str, default="research_classification_results.csv",
                         help="Output CSV file for results")
     
-    # Classification type
+    # Classification type (Note: current implementation only supports normal/abnormal)
     parser.add_argument("--classification_type", type=str, 
                         choices=['machine_type', 'machine_id'],
                         default='machine_type',
-                        help="Type of classification: machine_type (fan/pump/valve/slider) or machine_id (individual machines)")
+                        help="Type of classification (Note: current script is hardcoded for normal vs abnormal)")
     
     # Model selection
     parser.add_argument("--model", type=str, 
@@ -1270,7 +1297,7 @@ def main():
     logging.info("MIMII DATASET CLASSIFICATION EXPERIMENTS")
     logging.info("="*60)
     logging.info(f"Base directory: {args.base_dir}")
-    logging.info(f"Classification type: {args.classification_type}")
+    logging.info(f"Classification type: normal_vs_abnormal")
     logging.info(f"Model(s): {args.model}")
     logging.info(f"Feature params: n_mels={args.n_mels}, frames={args.frames}")
     logging.info(f"Training params: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
