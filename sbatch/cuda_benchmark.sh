@@ -7,7 +7,7 @@ sbatch \
     --cpus-per-task=1 \
     --gpus=1 \
     --mem=8000M \
-    --time=7-00-00-00 \
+    --time=7-00:00:00 \
     --chdir=/scratch/sdmuhsin/ess-anomaly-detection-sound \
     --output=./logs/cuda-benchmark-%N-%j.out \
     --wrap="
