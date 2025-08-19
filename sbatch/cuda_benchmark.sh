@@ -12,7 +12,7 @@ sbatch \
     --output=./logs/cuda-benchmark-%N-%j.out \
     --wrap="
 	export TORCH_HOME=\"./cache\"
-	module load gcc arrow cuda
+	module load python/3.11 gcc arrow cuda
 	source ./env/bin/activate
 	echo 'Environment loaded'
 	which python3
